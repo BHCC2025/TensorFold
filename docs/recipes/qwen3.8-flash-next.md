@@ -69,11 +69,14 @@ The default CUDA cap is six MTP drafts, with chains stopping below the configure
 Single-request serving uses CUDA graphs for verify windows and draft steps. Two-rank reductions add
 gathered partials in rank order.
 
-With one GPU, `--parallel N` enables eager shared forwards for up to N requests; CUDA
-`--parallel auto` selects one request. Two ranks serve one request at a time and reject `--parallel N`
-when N exceeds one. The single-request engine retains prompt and reply states for prefix reuse; the
-concurrent decoder retains prompt snapshots per stream. Cache capacity is allocated at startup; inspect
-the reported capacity rather than assuming an older fixed token limit.
+On one GPU or two ranks, `--parallel N` enables shared forwards for up to N requests, and a stream decoding alone
+replays the one-stream graphs; CUDA `--parallel auto` selects one request. With two ranks, pass the same N on both:
+rank 0 sends each admission, round and completion to rank 1 over one TCP connection on its `--master` address (an
+ephemeral port published through the rendezvous store). Under two-rank `--parallel`, a structured-output request
+(`response_format`, `guided_*`) is refused for now with an HTTP 400 before anything is generated, and Flash Next
+takes text only. The single-request engine retains prompt and reply states for prefix reuse; the concurrent decoder
+retains prompt snapshots per stream. Cache capacity is allocated at startup; inspect the reported capacity rather
+than assuming an older fixed token limit.
 
 N-gram tables are file-backed host data. On unified-memory GPUs they compete with weights and cache
 allocations for RAM, so a checkpoint's GPU allocation alone does not describe its memory requirement.

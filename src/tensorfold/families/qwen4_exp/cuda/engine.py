@@ -43,15 +43,13 @@ class FlashNextEngine:
 
         if tp not in (1, 2) or rank not in range(tp):
             raise ValueError(f"rank {rank} of {tp}: Flash Next runs on one GPU or two")
-        if streams > 1 and tp > 1:
-            raise ValueError("--parallel decodes several Flash Next requests together on one GPU; with --tp 2 it "
-                             "serves one request at a time for now, so drop --parallel")
         if not 0 <= int(depth) <= MAX_DEPTH:
             raise ValueError(f"MTP drafts a round: 0 to {MAX_DEPTH}, not {depth}")
         if not 0.0 <= float(confidence) <= 1.0:
             raise ValueError(f"MTP draft confidence: a probability from 0 to 1, not {confidence}")
         torch.cuda.set_device(0)
         self.tp, self.rank, self.depth, self.confidence = tp, rank, int(depth), float(confidence)
+        self.streams, self.master = int(streams), master
         self.kv_dtype = check_kv(kv_dtype)
         self.comm = None
         ids = draft_token_ids(draft_vocab) if self.depth > 0 else None
@@ -65,7 +63,9 @@ class FlashNextEngine:
         gather = (lambda values: gather_ints(torch, self.comm.all_gather, values)) if tp == 2 else None
         each, mtp, bits = self.depth + 1, self.depth > 0, BITS_OF[self.kv_dtype]
         # one admission for one stream or many (every slot, the shared rows and kept snapshots), before any load
-        geometry = ((lambda text: indexed_stream_geometry(text, streams, each, KEEP, mtp=mtp, kv_bits=bits))
+        # (streams + 1: the lone-stream graphs' window buffers, counted generously as one more stream for now)
+        geometry = ((lambda text: indexed_stream_geometry(text, streams + int(graphs and mtp), each, KEEP, mtp=mtp,
+                                                          kv_bits=bits, world=tp))
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits)))
         if exl3:
@@ -99,6 +99,11 @@ class FlashNextEngine:
         self.w = w
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
+        # a grammar is not in two-rank rounds yet: the server refuses it before a reply starts (HTTP 400), with this
+        self.refuses_structured_output = (
+            "structured output (response_format, guided_json and the like) is not served by Flash Next on two ranks "
+            "with --parallel yet: send the request without it, or start the server without --parallel"
+            if self.concurrent and tp == 2 else None)
         self.multi = self.scheduler = None
         if self.concurrent:
             from tensorfold.cuda.scheduler import Scheduler
@@ -107,7 +112,7 @@ class FlashNextEngine:
 
             self.e = None
             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
-                                      confidence=self.confidence, keep=KEEP, kv_dtype=self.kv_dtype)
+                                      confidence=self.confidence, keep=KEEP, kv_dtype=self.kv_dtype, graphs=graphs)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
@@ -133,6 +138,10 @@ class FlashNextEngine:
 
             warm(self.e)
         warm_s = time.perf_counter() - started
+        if self.concurrent and tp == 2 and rank == 0:     # from now on every decoder step is told to rank 1
+            from .multi import Link
+
+            self.multi.link = Link(self.comm.store, rank=0, host=master)
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.served = 0
@@ -141,7 +150,9 @@ class FlashNextEngine:
         rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
                 f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
         where = (f"{streams} streams of {self.context_window} prompt/reply tokens "
-                 f"({self.multi.slot_bytes / 2**20:.0f} MiB a stream), eager" if self.concurrent else
+                 f"({self.multi.slot_bytes / 2**20:.0f} MiB a stream), eager"
+                 f"{'; structured output refused on two ranks' if self.refuses_structured_output else ''}"
+                 if self.concurrent else
                  f"{self.context_window}-token prompt/reply window; {self.max_len}-token cache")
         if ple_on_ssd:
             how = "read from SSD at each lookup"
@@ -160,7 +171,7 @@ class FlashNextEngine:
         from .kvcache import BITS_OF
 
         total = int(ids.sum()) if ids is not None else -1
-        mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len,
+        mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len, self.streams,
                              len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype]],
                             dtype=torch.int64, device="cuda")
         both = torch.empty((2 * mine.numel(),), dtype=torch.int64, device="cuda")
@@ -168,7 +179,7 @@ class FlashNextEngine:
         both = both.view(2, -1).cpu()
         if not torch.equal(both[0], both[1]):
             raise RuntimeError(f"the two ranks were started with different settings (drafts, confidence, context, "
-                               f"draft vocabulary, KV cache): rank 0 {both[0].tolist()}, rank 1 {both[1].tolist()}")
+                               f"--parallel, draft vocabulary, KV cache): rank 0 {both[0].tolist()}, rank 1 {both[1].tolist()}")
 
     def _key(self, n: int) -> str:
         return f"tensorfold/flashnext/request/{n}"
@@ -177,6 +188,9 @@ class FlashNextEngine:
         """Rank 0: tell rank 1 to leave ``follow``."""
 
         if self.tp == 2 and self.rank == 0:
+            if self.multi is not None:
+                self.multi.link.send(["stop"])
+                return
             self.comm.store.set(self._key(self.served), json.dumps({"stop": True}))
 
     def _share(self, prompt: list[int], max_tokens: int, sampling, draft: bool, cached: int, constraint=None,
@@ -328,6 +342,11 @@ class FlashNextEngine:
     def follow(self) -> None:
         """Rank 1: decode every request rank 0 serves, until rank 0 stops."""
 
+        if self.multi is not None:
+            from .multi import Link
+
+            self.multi.follow(Link(self.comm.store, rank=1, host=self.master))
+            return
         while True:
             request = self._receive()
             if request is None:

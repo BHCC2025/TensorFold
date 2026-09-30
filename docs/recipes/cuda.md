@@ -43,12 +43,11 @@ separate prefill and decode forms. A shared call must preserve each row's arithm
 ## Requests and memory
 
 CUDA `--parallel auto` serves one request at a time. Set an explicit `--parallel N` above one for shared
-Qwen3.8-27B rounds on one or two ranks, or Flash Next on one rank. Flash Next rejects this setting with
-`--tp 2`; Nemotron, GLM and Qwen3.6 remain serialized. The shared scheduler admits requests between decode
-rounds, then verifies each active stream's drafts together and commits each stream independently. On the 27B,
-a new prompt prefills 1,024 tokens a round while the other streams keep decoding, and its state is kept at
-message starts (the second message and the last assistant turn), so prompts that share a system prompt or
-extend a conversation resume there with a fresh prefill's bits.
+Qwen3.8-27B or Flash Next rounds on one or two ranks; Nemotron, GLM and Qwen3.6 remain serialized. The shared
+scheduler admits requests between decode rounds, then verifies each active stream's drafts together and commits
+each stream independently. On the 27B, a new prompt prefills 1,024 tokens a round while the other streams keep
+decoding, and its state is kept at message starts (the second message and the last assistant turn), so prompts that
+share a system prompt or extend a conversation resume there with a fresh prefill's bits.
 
 Cache capacity is fixed at startup and bounds prompt plus reply.
 A positive context that exceeds the startup budget is refused; automatic capacity is an estimate.
