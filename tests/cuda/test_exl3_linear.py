@@ -130,7 +130,7 @@ def test_the_plan_depends_on_the_shape_only():
         assert per_warp >= 8 or (k // 16) < 8 * 8              # only a tiny layer may go below eight tiles
 
 
-MODES = (0, 6)                  # linear.MODE: linear_kernel at every row count; the mid-M kernels
+MODES = (0, 6, 7)               # linear.MODE: linear_kernel at every row count; the mid-M kernels; linear_wc
 # (bits, K, N, split): the 27B's projections with the loader's splits, a split layer of 32+ column blocks, others
 MODE_SHAPES = [(4, 17408, 5120, (1, 8)), (4, 5120, 10240, (5, 4)), (4, 5120, 6144, (5, 2)), (4, 6144, 5120, (16, 2)),
                (3, 17408, 5120, (4, 2)), (6, 5120, 4096, (5, 2)), (6, 1024, 2048, (1, 8)), (2, 2048, 1024, (2, 4))]
