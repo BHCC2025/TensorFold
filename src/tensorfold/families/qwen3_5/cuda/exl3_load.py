@@ -28,16 +28,21 @@ def quant_config(model_dir: Path) -> dict | None:
     return None
 
 
-def admission(geometry):
-    """An EXL3 pack's admission: the MLX path's geometry plus the prompt matmuls' workspace, and its tensors' bytes."""
+def admission(geometry, layer_major: bool = False):
+    """An EXL3 pack's admission: the MLX path's geometry plus the prompt matmuls' workspace, and its tensors' bytes.
+    ``layer_major``: a prompt run layer by layer keeps each row's residual stream (4 * hidden bytes) live."""
 
+    from tensorfold.cuda.capacity import Geometry
     from tensorfold.cuda.geometry import exl3_weights, exl3_workspace, with_fixed
 
     def with_workspace(text):
         from .prefill import CHUNK
 
         d, i = int(text["hidden_size"]), int(text["intermediate_size"])
-        return with_fixed(geometry(text), exl3_workspace(d * i, CHUNK, max(d, i)))
+        fixed = with_fixed(geometry(text), exl3_workspace(d * i, CHUNK, max(d, i)))
+        if not layer_major:
+            return fixed
+        return Geometry(lambda slots: fixed.bytes_at(slots) + 4 * d * slots, fixed.reserve, fixed.minimum_slots)
 
     return with_workspace, exl3_weights
 
