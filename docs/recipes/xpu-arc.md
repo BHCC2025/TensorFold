@@ -4,7 +4,7 @@ Status: experimental. One checkpoint, one card class, one request at a time. Eve
 [Tested setup](#tested-setup); nothing is claimed for other cards.
 
 The Intel GPU backend runs OpenCL C kernels compiled to SPIR-V (`ocloc`) through Level Zero. It is a separate Linux build
-(`-Dxpu`) and has no CUDA or Metal code in its path.
+(`-Dxpu`), selected with `--backend xpu` on the native server, and has no CUDA or Metal code in its path.
 
 ## Supported
 
@@ -13,7 +13,8 @@ The Intel GPU backend runs OpenCL C kernels compiled to SPIR-V (`ocloc`) through
 | Model | Nemotron 3.5 Lightning 30B-A3B, MLX affine 4-bit, group 64 (the checkpoint named in [nemotron-3.5.md](nemotron-3.5.md)) |
 | Card | Intel Arc Pro B70 (Battlemage, 32 GB) |
 | Not supported | NVFP4 and FP8-Mamba checkpoints: refused at load with `NVFP4 checkpoints are not supported on the XPU backend yet; use the MLX 4-bit checkpoint`. They need FP4/FP8 dequantisation kernels that do not exist yet. |
-| Not supported | MTP or copy drafts (every request decodes serially), tool-call gates, grammars and structured output, prompt cache and prefix reuse |
+| Not supported | MTP or copy drafts (every request decodes serially), tool-call gates, grammars and structured output, prompt cache and prefix reuse, concurrent decoding (requests queue and run one at a time) |
+| Sampling | Greedy uses the device argmax. A request with temperature above 0 is drawn on the host from the step's logits with the lane core's keyed sampler: temperature, `top_k`, `top_p`, `min_p` and `seed`; the draw is keyed by seed, absolute token position and candidate id. Presence and repetition penalties are not implemented. |
 | Qwen3.8 | Not covered by this page. |
 
 ## Build and run
@@ -23,13 +24,19 @@ Needs Zig 0.17.0, `ocloc` and the Level Zero loader with the Intel compute runti
 
 ```bash
 zig build -Dxpu                 # tensorfold-xpu (token-id CLI) and tf-xpu-test
+zig build -Dxpu native-xpu      # zig-out/native-xpu/bin/tensorfold-native with the Intel GPU engine
 zig build -Dxpu xpu-tests       # tf-xpu-<name>-test programs (checks and benchmarks)
 
 tensorfold-xpu devices
 tensorfold-xpu run MODEL --tokens-file ids.txt --max-tokens 128 --prefill 512
+zig-out/native-xpu/bin/tensorfold-native serve MODEL --backend xpu --context 32768
+zig-out/native-xpu/bin/tensorfold-native capabilities --json
 ```
 
-`--prefill ROWS` prefills the prompt in windows of ROWS tokens (16 and up); the plain loop then decodes.
+`--prefill ROWS` prefills the prompt in windows of ROWS tokens (16 and up); the plain loop then decodes. `--context` defaults
+to the model window capped at 32768 in `serve`. `tensorfold-native capabilities --json` reports `"backends": ["xpu"]`, the
+chip class `intel-<PCI device id>` (`intel-e223` here) and the family `nemotron_h` with format `mlx-q4g64`.
+
 Run model programs one at a time: `tools/zig/xpu_guard.sh SECONDS COMMAND...` takes the GPU lock, refuses to start while other
 processes hold more than 8 GB of device memory and stops the command only with SIGINT.
 
@@ -42,8 +49,44 @@ Nemotron MLX 4-bit checkpoint (`TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B
 ## Measurements
 
 Decode, 128 greedy tokens from a 5-token prompt: 5.72 ms/token, 175 tok/s (`tensorfold-xpu run`, five runs on different
-commits: 173.6 to 174.8).
-Prefill throughput falls as attention grows with the context. The prompt attention
+commits: 173.6 to 174.8). Through the native server (the engine runs behind the lane core), greedy, 256 tokens, `tools/bench_openai.py`: 172.5 tok/s
+(raw code prompt) and 172.5 tok/s (chat prose prompt, thinking off), first token after 0.09 to 0.10 s.
+
+Concurrency (`tools/bench_concurrent.py --levels 1,4 --alone --serial`, 256 tokens, temperature 0): one stream 171.9 tok/s (code) and 172.3 (chat);
+four streams 164.3 and 163.9 tok/s aggregate (each reply took its turn at about 171 tok/s; the last of four waited about 5 s
+for its first token). All 12 four-stream replies equalled their solo run, and 3 of 3 for one stream; 0 failed.
+
+Cold prefill through `/v1/completions` with token-id prompts (the first L tokens of a public text under the model's
+tokenizer), `--prompt-cache-gib 0`, `cached_tokens` 0, 8 tokens generated:
+
+| Prompt tokens | Prefill s | Prefill tok/s | Decode tok/s after it |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 0.66 | 3,108 | 173.2 |
+| 8,192 | 2.65 | 3,086 | 168.9 |
+| 32,768 | 11.3 | 2,888 | 160.3 |
+| 65,536 | 24.7 | 2,652 | 151.5 |
+| 131,072 | 57.4 | 2,281 | 137.2 |
+| 262,080 (the native window less a reply) | 147.5 | 1,777 | 113.6 |
+
+Against llama.cpp on the same card (build 9c2e0e491, Vulkan, Mesa 25.2.8, Q4_0 GGUF of 17.59 GiB, `-ngl 99 -fa on`; a different
+quantization from the MLX 4-bit checkpoint above, so this compares engines as users run them, not arithmetic). `llama-server`
+with `-c 131584 -np 1`, f16 KV cache, prompt cache off, the same token arrays, 8 tokens generated (32 for the 64k and 128k rows; the first request after
+the start of the llama.cpp server took 2.28 s at 2k tokens with warm-up):
+
+| Prompt tokens | llama.cpp prefill s | This engine prefill s | llama.cpp decode tok/s after it | This engine decode tok/s after it |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 1.57 | 0.66 | 44.5 | 173.2 |
+| 8,192 | 6.93 | 2.65 | 40.5 | 168.9 |
+| 32,768 | 41.8 | 11.3 | 31.0 | 160.3 |
+| 65,536 | 126.5 (518 tok/s) | 24.7 | 23.4 | 151.5 |
+| 131,072 | 432.2 (303 tok/s) | 57.4 | 15.6 | 137.2 |
+
+Peak device memory of the llama.cpp server was 19.0 GB in a run at `-c 33280` and 19.70 GB over the 64k and 128k run at `-c 131584`
+(one peak for the whole run); nothing failed or ran out of memory.
+`llama-bench` on the same file gives prompt processing of 1,401.8 tok/s at 2,048 tokens, 1,220.2 at 8,192 and 796.4 at 32,768,
+33.0 tok/s for 256 generated tokens and 24.05 tok/s for 128 tokens at 32k depth (a q8 KV cache was slower: 27.7 for 256 tokens).
+
+Prefill throughput falls from 3.1k tok/s at 2k tokens to 2.3k at 128k and 1.8k at the native window as attention grows with the context. The prompt attention
 runs on the matrix engine (`nem_attn_pfs.cl`; `NEM_OLD_ATTN=1` selects the earlier per-row kernels, which took 3.45 s, 26.6 s and 389.5 s for prompts of 8,192, 32,768 and 131,000 tokens against 2.62 s, 11.3 s and 57.5 s with the
 matrix-engine kernel, in 512-row windows, with identical tokens afterwards). Against the per-row kernels its output differs by at most 5.6e-3 of the largest output magnitude (bf16
 outputs), is identical for any chunking of the window, and the reply tokens of the 8k, 32k and 128k prompts did not change
@@ -59,9 +102,12 @@ the largest output magnitude against 2.1e-3 to 3.4e-3). Decode at 8,192 and 131,
 Long context: a needle (a secret code planted at 50% depth in public text) was found at 8,192 tokens (prefill 3,103 tok/s,
 decode 171.1 tok/s) and at 131,072 tokens (prefill 2,285 tok/s, 62 s wall, decode 137.8 tok/s).
 
-Memory, measured on the 32 GB card (`tensorfold-xpu run`, device allocation counter): 17.85 GB for the weights, 18.05 GB with a
-4k context, 18.56 GB after an 8k prompt in 512-row windows, 18.71 GB after a 32k prompt and 19.37 GB after a 128k prompt. The weights alone
-are 17.3 GiB, so this model does not fit a 16 GB card; no 16 GB claim is made.
+Memory, measured on the 32 GB card in a host with 62.2 GiB of RAM and 24 threads (kernel 7.0.0, `tensorfold-native serve`,
+KV caches and scratch allocated at load for the chosen context): device allocation counter 17.85 GB for the weights, 18.53 GB
+at `--context 4096`, 19.37 GB at 131,200 and 20.25 GB at 262,144 (the native window), unchanged by the prompts that follow.
+Host process: 339 MB resident after load, 355 MB at its peak after a 262,080-token prompt (VmHWM); the engine pins only its
+staging buffers. Load is ready in 7 s with the checkpoint in the page cache. After SIGINT the server exits in 0.2 s with status
+0 and no device memory left. The weights alone are 17.3 GiB, so this model does not fit a 16 GB card; no 16 GB claim is made.
 
 ## Accuracy
 
@@ -123,6 +169,10 @@ prefill kernels separately; every class is within the test's bounds):
   0.68 against a maximum magnitude of 33, SSM 1.95 against 5,710, KV 1.8 against 24), and the next 8 decode steps differ by up
   to 0.94 in logit with the same top-1 on real text (6 of 8 on random ids, whose distributions are nearly flat). Windows
   followed by the plain decode loop differ from windows followed by one-row windows by up to 0.38 (text) in logit.
+- Queued requests: concurrent replies equal their solo runs (above). A client that disconnects mid-stream cancels its request
+  and the next request gives the same tokens as before; seeded sampling repeats exactly; SIGINT or SIGTERM during a generation ends
+  the running stream after its current token with an error event (`ShuttingDown`) and `[DONE]`, answers a queued
+  request with the error `the server is shutting down`, exits with status 0 within 0.2 s and leaves no device memory held.
 - Host-side slot ring: forwards queued without a sync equal synced forwards (`tf-xpu-nem_slot-test`).
 
 ## Tests
@@ -136,5 +186,6 @@ reads`, which fails the same way on an unmodified upstream 1.0.2 checkout on thi
 
 - One request at a time; no drafts; about 172 tok/s at short context, 137 tok/s at 128k and 113 tok/s at 256k (decode).
 - Prefill throughput falls from 3.1k tok/s at 2k tokens to 2.3k tok/s at 128k and 1.8k at the native window.
+- A shutdown during a generation ends the stream with an error event rather than a finish reason.
 - The 16-row and 1-row decode kernels and the prefill GEMMs are not bit-identical to each other (see Exactness).
 - Single card, single process: the 17.3 GiB of weights leave about 14 GB on a 32 GB card.

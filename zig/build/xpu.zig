@@ -72,7 +72,6 @@ const test_programs = [_][]const u8{
 
 /// `-Dxpu` (Linux): the SPIR-V images, `tensorfold-xpu` and `tf-xpu-test`; needs ocloc, not nvcc or CUDA.
 pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
-    _ = build_options;
     const enabled = b.option(bool, "xpu", "Build the Intel GPU engine (needs ocloc, no CUDA)") orelse false;
     const ocloc = b.option([]const u8, "ocloc", "ocloc for the Intel GPU kernels (default: ocloc)") orelse "ocloc";
     const device = b.option([]const u8, "xpu-device", "ocloc -device for the SPIR-V (default bmg)") orelse "bmg";
@@ -91,6 +90,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("core", mods.core);
     runner.addImport("nemotron_xpu", mods.nemotron);
     b.installArtifact(b.addExecutable(.{ .name = "tf-xpu-test", .root_module = runner }));
+    nativeServer(b, target, optimize, xpu, mods, build_options);
     const tests_step = b.step("xpu-tests", "Build the standalone Intel GPU op and model tests (tf-xpu-<name>-test)");
     for (test_programs) |name| {
         const mod = b.createModule(.{ .root_source_file = b.path(b.fmt("zig/tests/xpu/{s}.zig", .{name})), .target = target, .optimize = optimize, .link_libc = true });
@@ -106,5 +106,41 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     const host = b.graph.host;
     const xpu = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, xpu);
-    for ([_]*std.Build.Module{ xpu, mods.nemotron, cliModule(b, host, .debug, xpu, mods) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    const native = nativeEngines(b, host, .debug, xpu, mods).engines;
+    for ([_]*std.Build.Module{ xpu, mods.nemotron, cliModule(b, host, .debug, xpu, mods), native }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+}
+
+/// zig build -Dxpu native-xpu: tensorfold-native (capabilities, models, info, pull, serve) with the Intel GPU engine.
+fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, xpu: *std.Build.Module, mods: Modules, build_options: *std.Build.Step.Options) void {
+    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const m = nativeEngines(b, target, optimize, xpu, mods);
+    const api = m.api;
+    const engines = m.engines;
+    // the HTTP side keeps its safety checks; the engine below it runs at 
+    const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    const checkpoint_cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "native_engines", .module = engines }} });
+    const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/server/main.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = engines }, .{ .name = "checkpoint_cli", .module = checkpoint_cli } },
+    }) });
+    exe.root_module.addOptions("build_options", build_options);
+    const install = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "native-xpu/bin" } } });
+    b.step("native-xpu", "tensorfold-native with the Intel GPU engine into zig-out/native-xpu/bin").dependOn(&install.step);
+}
+
+/// The engine contract and the Intel GPU engines a native server opens (native/xpu.zig).
+fn nativeEngines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, xpu: *std.Build.Module, mods: Modules) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+    const lanes = mods.lanes;
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const engines = b.createModule(.{
+        .root_source_file = b.path("zig/src/native/xpu.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "xpu", .module = xpu }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron_xpu", .module = mods.nemotron } },
+    });
+    return .{ .api = api, .engines = engines };
 }
