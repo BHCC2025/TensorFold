@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 /// The families this host serves, each a file with its table row, loader and prompt window.
 const specs = .{
     @import("xpu_nemotron.zig"),
+    @import("xpu_qwen.zig"),
 };
 
 pub const backends: []const []const u8 = &.{"xpu"};
@@ -159,8 +160,9 @@ fn openFamily(comptime S: type, a: Allocator, gpa: Allocator, io: std.Io, o: api
     return .{ .engine = h.host.engine(), .close = Host(S).close, .ctx = h };
 }
 
-test "the family table names Nemotron-H" {
+test "the family table names Nemotron-H and Qwen3.5" {
     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
+    try std.testing.expectEqualStrings("qwen3_5", families[1].model_type);
     try std.testing.expectEqualStrings("xpu", backends[0]);
     _ = lane;
 }

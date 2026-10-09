@@ -1,9 +1,10 @@
-//! The Intel GPU half of the root build: OpenCL C kernels to SPIR-V with ocloc, the runtime, Nemotron, the CLI.
+//! The Intel GPU half of the root build: OpenCL C kernels to SPIR-V with ocloc, the runtime, Nemotron, Qwen, the CLI.
 
 const std = @import("std");
 
 /// One SPIR-V image: the .cl in zig/kernels/xpu (`src`, else `name`) and its ocloc options (dot/matrix kernels: CL3.0).
 const Kernel = struct { name: []const u8, src: ?[]const u8 = null, options: []const u8 = "", include: bool = false };
+// include: the source reads ggml_tables.h beside it (a header is a build input).
 
 const cl3 = "-cl-std=CL3.0";
 
@@ -16,6 +17,28 @@ const kernels = [_]Kernel{
     .{ .name = "glue" },
     .{ .name = "qmv4" },
     .{ .name = "vadd" },
+    .{ .name = "qwen_basic" },
+    .{ .name = "qwen_gdn" },
+    .{ .name = "qwen_attn" },
+    .{ .name = "qwen_rows" },
+    .{ .name = "qwen_mlx4", .options = cl3 },
+    .{ .name = "qwen_mlx4_pf", .options = cl3 },
+    .{ .name = "qwen_small", .options = cl3 },
+    .{ .name = "qwen_kvq", .options = cl3 },
+    .{ .name = "qwen_attn_long", .options = cl3 },
+    .{ .name = "qwen_attn_long_q8", .src = "qwen_attn_long", .options = cl3 ++ " -DKVQ=8" },
+    .{ .name = "qwen_attn_long_q4", .src = "qwen_attn_long", .options = cl3 ++ " -DKVQ=4" },
+    .{ .name = "qwen_attn_pf", .options = cl3 },
+    .{ .name = "qwen_attn_pfs", .options = cl3 },
+    .{ .name = "qwen_attn_pfs_q4", .src = "qwen_attn_pfs", .options = cl3 ++ " -DFP16 -DKVQ=4" },
+    .{ .name = "qwen_attn_pfs_q8", .src = "qwen_attn_pfs", .options = cl3 ++ " -DFP16 -DKVQ=8" },
+    .{ .name = "qwen_dpasbench" },
+    .{ .name = "exl3", .options = cl3 },
+    .{ .name = "exl3_mul1", .src = "exl3", .options = cl3 ++ " -DEXL3_MUL1_ONLY=1" },
+    .{ .name = "exl3_pf2d" },
+    .{ .name = "ggml_quant", .options = cl3 ++ " -cl-fp32-correctly-rounded-divide-sqrt", .include = true },
+    .{ .name = "ggml_pfgemm" },
+    .{ .name = "qwen_f16pf" },
     .{ .name = "nem_rows", .options = cl3 },
     .{ .name = "nem_pf", .options = cl3 },
     .{ .name = "nem_attn_pfs", .options = cl3 },
@@ -32,7 +55,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return xpu;
 }
 
-const Modules = struct { core: *std.Build.Module, nemotron: *std.Build.Module, lanes: *std.Build.Module };
+const Modules = struct { core: *std.Build.Module, nemotron: *std.Build.Module, qwen: *std.Build.Module, lanes: *std.Build.Module };
 
 fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, xpu: *std.Build.Module) Modules {
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -41,7 +64,10 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     nemotron.addImport("xpu", xpu);
     nemotron.addImport("core", core);
     nemotron.addImport("lanes", lanes);
-    return .{ .core = core, .nemotron = nemotron, .lanes = lanes };
+    const qwen = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    qwen.addImport("xpu", xpu);
+    qwen.addImport("core", core);
+    return .{ .core = core, .nemotron = nemotron, .qwen = qwen, .lanes = lanes };
 }
 
 fn cliModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, xpu: *std.Build.Module, mods: Modules) *std.Build.Module {
@@ -49,6 +75,7 @@ fn cliModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     cli.addImport("xpu", xpu);
     cli.addImport("core", mods.core);
     cli.addImport("nemotron_xpu", mods.nemotron);
+    cli.addImport("qwen_xpu", mods.qwen);
     return cli;
 }
 
@@ -57,7 +84,7 @@ fn spirv(b: *std.Build, ocloc: []const u8, device: []const u8, k: Kernel) std.Bu
     const run = b.addSystemCommand(&.{ ocloc, "compile", "-device", device, "-spv_only", "-output", k.name, "-output_no_suffix", "-q" });
     // ocloc builds from a copy of the source, so the header directory is named (the Run step's cwd is the build root)
     if (k.options.len > 0) run.addArgs(&.{ "-options", if (k.include) b.fmt("{s} -I zig/kernels/xpu", .{k.options}) else k.options });
-    _ = k.include;
+    if (k.include) run.addFileInput(b.path("zig/kernels/xpu/ggml_tables.h"));
     run.addArg("-file");
     run.addFileArg(b.path(b.fmt("zig/kernels/xpu/{s}.cl", .{k.src orelse k.name})));
     run.addArg("-out_dir");
@@ -67,7 +94,9 @@ fn spirv(b: *std.Build, ocloc: []const u8, device: []const u8, k: Kernel) std.Bu
 
 /// The standalone op and model tests, each its own program `tf-xpu-<name>-test` (step `xpu-tests`).
 const test_programs = [_][]const u8{
-    "panic", "nem_rows", "nem_prefill", "nem_gen", "nem_mtp", "nem_kl", "nem_norm_bench", "nem_mv_bench", "nem_slot", "nem_format", "nem_seam", "nem_attn_pf", "nem_attn_dec", "nem_fp64",
+    "exl3", "ggml", "qwen_attnbench", "qwen_attnpfq", "qwen_attnpf", "qwen_dpasbench", "panic", "nem_rows", "nem_prefill", "nem_gen", "nem_mtp", "nem_kl", "nem_norm_bench", "nem_mv_bench", "nem_slot", "nem_format", "nem_seam", "nem_attn_pf", "nem_attn_dec", "nem_fp64", "qwen_slot", "qwen_attnlong", "qwen_attn", "qwen_basic", "qwen_drift", "qwen_genbatch", "qwen_gdn", "qwen_kl", "qwen_kvq", "qwen_launch",
+    "qwen_longctx", "qwen_mlp", "qwen_mlx4_api", "qwen_mlx4b_rows", "qwen_mlx4_pf", "qwen_mlx4_rows", "qwen_mlx4", "qwen_mtp_gguf", "qwen_mtp",
+    "qwen_needle", "qwen_prefill", "qwen_seam", "qwen_fp64", "qwen_gdnrows", "qwen_copyidx", "qwen_rmsorder", "qwen_rows", "qwen_small", "qwen_wincost",
 };
 
 /// `-Dxpu` (Linux): the SPIR-V images, `tensorfold-xpu` and `tf-xpu-test`; needs ocloc, not nvcc or CUDA.
@@ -89,6 +118,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("xpu", xpu);
     runner.addImport("core", mods.core);
     runner.addImport("nemotron_xpu", mods.nemotron);
+    runner.addImport("qwen_xpu", mods.qwen);
     b.installArtifact(b.addExecutable(.{ .name = "tf-xpu-test", .root_module = runner }));
     nativeServer(b, target, optimize, xpu, mods, build_options);
     const tests_step = b.step("xpu-tests", "Build the standalone Intel GPU op and model tests (tf-xpu-<name>-test)");
@@ -97,6 +127,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         mod.addImport("xpu", xpu);
         mod.addImport("core", mods.core);
         mod.addImport("nemotron_xpu", mods.nemotron);
+        mod.addImport("qwen_xpu", mods.qwen);
         tests_step.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = b.fmt("tf-xpu-{s}-test", .{name}), .root_module = mod }), .{}).step);
     }
 }
@@ -107,7 +138,7 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     const xpu = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, xpu);
     const native = nativeEngines(b, host, .debug, xpu, mods).engines;
-    for ([_]*std.Build.Module{ xpu, mods.nemotron, cliModule(b, host, .debug, xpu, mods), native }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ xpu, mods.nemotron, mods.qwen, cliModule(b, host, .debug, xpu, mods), native }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
 }
 
 /// zig build -Dxpu native-xpu: tensorfold-native (capabilities, models, info, pull, serve) with the Intel GPU engine.
@@ -140,7 +171,7 @@ fn nativeEngines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "xpu", .module = xpu }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron_xpu", .module = mods.nemotron } },
+        .imports = &.{ .{ .name = "xpu", .module = xpu }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron_xpu", .module = mods.nemotron }, .{ .name = "qwen_xpu", .module = mods.qwen } },
     });
     return .{ .api = api, .engines = engines };
 }

@@ -4,6 +4,7 @@ const std = @import("std");
 const xpu = @import("xpu");
 const core = @import("core");
 const nemotron = @import("nemotron_xpu");
+const qwen = @import("qwen_xpu");
 const decode = xpu.decode;
 
 /// A panic drains the device queue (bounded wait) before the default panic runs, so no work is left queued.
@@ -12,9 +13,11 @@ pub const panic = std.debug.FullPanic(xpu.rt.panicDrain);
 const usage =
     \\usage: tensorfold-xpu run MODEL --tokens ID,ID,... | --tokens-file PATH [--max-tokens N] [--no-drafts] [--ignore-eos] [--context N]
     \\         [--device N] [--force ID,ID,...] [--logits] [--report PATH]
+    \\         Qwen only: [--prefill ROWS|auto] [--spec K [--drafter copy|mtp|auto] [--mtp-from DIR] [--spec-min-n N]] [--kv bf16|q8|q4]
     \\       tensorfold-xpu devices
     \\  --force   teacher forcing: feed these ids after the prompt, one step per id (the end token never stops)
-    \\  --prefill ROWS  the prompt in windows of ROWS tokens (16 and up)
+    \\  --prefill ROWS  the prompt in windows of ROWS tokens (16 and up; auto: the largest of 2048/1024/512/256 that fits the memory left); --spec K  speculative decoding, K drafts a window, the output is the plain greedy run's
+    \\  --kv      KV cache format, default q8; q4 holds more context at a cost (the model's limit is 131072 positions)
     \\  --logits  print each step's five largest logits ("step N pos P top5: id:logit ...")
     \\  Serial decode only: MTP drafts, sampling and the CUDA engine's graph and kernel options are not available here.
     \\
@@ -34,8 +37,16 @@ const Options = struct {
     device: ?u32 = null,
     report: ?[]const u8 = null,
     prefill: u32 = 0,
+    prefill_auto: bool = false,
+    spec_k: usize = 0,
+    drafter: Drafter = .copy,
+    mtp_from: ?[]const u8 = null,
+    min_n: usize = 3,
+    kv: Kv = .q8,
 };
 
+const Drafter = enum { copy, mtp, auto };
+const Kv = enum { bf16, q8, q4 };
 
 const Parsed = union(enum) { run: Options, refuse: []const u8 };
 
@@ -74,7 +85,7 @@ fn parse(gpa: std.mem.Allocator, model: []const u8, rest: []const []const u8) !P
     var i: usize = 0;
     while (i < rest.len) : (i += 1) {
         const a = rest[i];
-        const takes = for ([_][]const u8{ "--tokens", "--tokens-file", "--max-tokens", "--context", "--ctx", "--device", "--force", "--report", "--prefill" }) |n| {
+        const takes = for ([_][]const u8{ "--tokens", "--tokens-file", "--max-tokens", "--context", "--ctx", "--device", "--force", "--report", "--prefill", "--spec", "--drafter", "--mtp-from", "--spec-min-n", "--kv" }) |n| {
             if (std.mem.eql(u8, a, n)) break true;
         } else false;
         if (takes and i + 1 >= rest.len) return refuse(gpa, o, "missing value after the option");
@@ -98,7 +109,17 @@ fn parse(gpa: std.mem.Allocator, model: []const u8, rest: []const []const u8) !P
         } else if (std.mem.eql(u8, a, "--report")) {
             o.report = value;
         } else if (std.mem.eql(u8, a, "--prefill")) {
-            o.prefill = try std.fmt.parseInt(u32, value, 10);
+            if (std.mem.eql(u8, value, "auto")) o.prefill_auto = true else o.prefill = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, a, "--spec")) {
+            o.spec_k = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, a, "--spec-min-n")) {
+            o.min_n = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, a, "--mtp-from")) {
+            o.mtp_from = value;
+        } else if (std.mem.eql(u8, a, "--drafter")) {
+            o.drafter = std.meta.stringToEnum(Drafter, value) orelse return refuse(gpa, o, a);
+        } else if (std.mem.eql(u8, a, "--kv")) {
+            o.kv = std.meta.stringToEnum(Kv, value) orelse return refuse(gpa, o, a);
         } else if (std.mem.eql(u8, a, "--ignore-eos")) {
             o.stop_eos = false;
         } else if (std.mem.eql(u8, a, "--logits")) {
@@ -124,7 +145,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     const parsed = try parse(gpa, args[2], args[3..]);
-    const o = switch (parsed) {
+    var o = switch (parsed) {
         .run => |o| o,
         .refuse => |what| {
             if (isUnsupported(what)) {
@@ -148,6 +169,10 @@ pub fn main(init: std.process.Init) !u8 {
     if (!hasNoDrafts(args)) std.debug.print("MTP drafts are not available on the Intel GPU engine: decoding serially\n", .{});
     switch (fam) {
         .nemotron => {
+            if (o.prefill_auto) {
+                std.debug.print("--prefill auto is available for Qwen only\n", .{});
+                return 2;
+            }
             const e = nemotron.Engine.init(gpa, init.io, &ctx, o.model, .{ .context = o.context, .progress = true, .window_rows = o.prefill }) catch |err| {
                 if (err == error.UnsupportedFormat) {
                     std.debug.print("{s} is not a checkpoint the Intel GPU engine reads: NVFP4 checkpoints are not supported on the XPU backend yet; use the MLX 4-bit checkpoint\n", .{o.model});
@@ -158,18 +183,30 @@ pub fn main(init: std.process.Init) !u8 {
             defer e.deinit();
             return load(gpa, init.io, e, o);
         },
+        .qwen => {
+            const e = try qwen.Engine.init(gpa, init.io, &ctx, o.model, .{ .context = o.context, .progress = true, .kv = std.meta.stringToEnum(@TypeOf(qwen.attn_long.Mode.bf16), @tagName(o.kv)).?, .window_rows = if (o.prefill_auto) qwen.engine.auto_window else o.prefill });
+            defer e.deinit();
+            if (o.prefill_auto) {
+                o.prefill = qwen.win.chosen_rows;
+                std.debug.print("prefill window chosen from the memory left: {d} rows\n", .{o.prefill});
+            }
+            return load(gpa, init.io, e, o);
+        },
     }
 }
 
-const Family = enum { nemotron };
+const Family = enum { nemotron, qwen };
 
 /// The family a config.json's model_type names; any other type is refused.
 fn family(model_type: []const u8) ?Family {
     if (std.mem.eql(u8, model_type, "nemotron_h")) return .nemotron;
+    if (std.mem.eql(u8, model_type, "qwen3_5")) return .qwen;
     return null;
 }
 
 fn detect(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Family {
+    // a GGUF file carries its architecture in its own header; the Qwen engine checks it
+    if (std.mem.endsWith(u8, dir, ".gguf")) return .qwen;
     const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
     defer gpa.free(path);
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22)) catch |e| {
@@ -182,7 +219,7 @@ fn detect(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Family {
     const t = if (parsed.value == .object) parsed.value.object.get("model_type") else null;
     const name = if (t) |v| (if (v == .string) v.string else "") else "";
     return family(name) orelse {
-        std.debug.print("model_type \"{s}\" in {s} is not supported on the Intel GPU engine (nemotron_h)\n", .{ name, path });
+        std.debug.print("model_type \"{s}\" in {s} is not supported on the Intel GPU engine (nemotron_h, qwen3_5)\n", .{ name, path });
         return error.UnsupportedModel;
     };
 }
@@ -190,6 +227,7 @@ fn detect(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Family {
 fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, o: Options) !u8 {
     std.debug.print("loaded in {d:.1} s, device memory {d:.2} GB\n", .{ e.load_seconds, @as(f64, @floatFromInt(e.deviceBytes())) / 1e9 });
     return run(gpa, io, e, o) catch |err| {
+        // the Qwen entry points drain the queue and return Interrupted on a stop request; leaving here frees everything
         if (std.mem.eql(u8, @errorName(err), "Interrupted")) {
             std.debug.print("interrupted: the queue was drained, device memory is freed on exit\n", .{});
             return 130;
@@ -215,10 +253,35 @@ fn devices() !u8 {
     return 0;
 }
 
+/// Qwen's windowed modes: prompt windows and speculative decoding.
+fn generateFast(e: anytype, io: std.Io, o: Options, count: usize) !decode.Result {
+    return e.generateFast(io, o.tokens, count, .{
+        .prefill_rows = o.prefill,
+        .spec_k = o.spec_k,
+        .drafter = std.meta.stringToEnum(qwen.engine.DrafterKind, @tagName(o.drafter)).?,
+        .mtp_from = o.mtp_from,
+        .min_n = o.min_n,
+        .stop_eos = o.stop_eos,
+    });
+}
+
 fn run(gpa: std.mem.Allocator, io: std.Io, e: anytype, o: Options) !u8 {
     const room = if (o.force) |f| f.len else e.max_len + 1 - @min(e.max_len + 1, o.tokens.len);
     const count = @max(1, @min(o.max_tokens, room));
-    const res = try decode.generate(gpa, io, e, o.tokens, count, .{ .stop_eos = o.stop_eos, .force = o.force, .top5 = o.logits, .prefill_rows = o.prefill });
+    // Nemotron windows its prompt in the plain loop (--force and --logits work); Qwen's windowed modes are generateFast
+    const windowed = comptime !@hasField(@TypeOf(e.*), "stats");
+    const fast = o.spec_k > 0 or (o.prefill > 0 and !windowed);
+    if (fast and (o.force != null or o.logits)) {
+        std.debug.print("--prefill and --spec run in windows: they cannot be combined with --force or --logits\n", .{});
+        return 2;
+    }
+    if (comptime !@hasField(@TypeOf(e.*), "stats")) {
+        if (o.spec_k > 0 or o.drafter != .copy or o.kv != .q8 or o.mtp_from != null) {
+            std.debug.print("--spec, --drafter, --mtp-from and --kv are available for Qwen models only\n", .{});
+            return 2;
+        }
+    }
+    const res = if (comptime @hasField(@TypeOf(e.*), "stats")) (if (fast) try generateFast(e, io, o, count) else try decode.generate(gpa, io, e, o.tokens, count, .{ .stop_eos = o.stop_eos, .force = o.force, .top5 = o.logits })) else try decode.generate(gpa, io, e, o.tokens, count, .{ .stop_eos = o.stop_eos, .force = o.force, .top5 = o.logits, .prefill_rows = o.prefill });
     defer gpa.free(res.tokens);
     defer gpa.free(res.top5);
     defer gpa.free(res.lpf);
@@ -240,6 +303,10 @@ fn run(gpa: std.mem.Allocator, io: std.Io, e: anytype, o: Options) !u8 {
     const hex = std.fmt.bytesToHex(digest, .lower);
     const steps = @max(1, res.tokens.len -| 1);
     const ms = res.decode_seconds * 1e3 / @as(f64, @floatFromInt(steps));
+    if (comptime @hasField(@TypeOf(e.*), "stats")) if (o.spec_k > 0) {
+        const st = e.stats;
+        std.debug.print("spec {s} k={d}: windows {d}, plain steps {d}, drafted {d}, accepted {d}\n", .{ @tagName(o.drafter), o.spec_k, st.windows, st.plain, st.drafted, st.accepted });
+    };
     std.debug.print("tokens {d} sha {s} prefill {d:.4}s decode {d:.4}s {d:.3} ms/token ({d:.1} tokens/s) rounds {d} accepted 0\n", .{ res.tokens.len, hex[0..12], res.prefill_seconds, res.decode_seconds, ms, 1e3 / ms, res.rounds });
     if (o.report) |path| {
         const report = .{
@@ -278,6 +345,7 @@ test "the CUDA run options this engine cannot honour are refused by name" {
 
 test "model types pick a family, others are refused" {
     try std.testing.expectEqual(Family.nemotron, family("nemotron_h").?);
+    try std.testing.expectEqual(Family.qwen, family("qwen3_5").?);
     try std.testing.expect(family("llama") == null and family("") == null);
 }
 
