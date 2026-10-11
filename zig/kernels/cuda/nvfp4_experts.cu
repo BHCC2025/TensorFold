@@ -171,13 +171,15 @@ template <int M, int EPI, int RT, int WM, int WN>
 __device__ __forceinline__ void prompt_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
                                             const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
                                             const int* __restrict__ items, const int* __restrict__ counts,
-                                            const int* __restrict__ members, void* __restrict__ out, int N, float limit) {
+                                            const int* __restrict__ members, void* __restrict__ out, int N, float limit,
+                                            int skip) {
   using P = Prompt4<M, RT, WM, WN>;
   constexpr int STAGES = P::STAGES;
   extern __shared__ uint4 sm[];
   const int nbt = (NB + WN - 1) / WN, it = blockIdx.x / nbt, cbt = blockIdx.x - it * nbt;
   if (it >= __ldg(counts)) return;
   const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+  if (e == skip) return;  // an expert the family computes itself, left alone as the decode form does
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp / WN, wn = warp - wm * WN;
   const int t = lane & 3, gq = lane >> 2, cb = cbt * WN + wn, cbs = min(WN, NB - cbt * WN);
   const __nv_bfloat16* xsrc[P::XPT];
@@ -304,9 +306,9 @@ template __global__ void nvfp4_expert_kernel<1, 1, 4>(const __nv_bfloat16* __res
   extern "C" __global__ void __launch_bounds__(WN * 32) NAME(                                                        \
       const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,                     \
       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items, const int* __restrict__ counts, \
-      const int* __restrict__ members, void* __restrict__ out, int N, float limit) {                                 \
+      const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {                       \
     tf_nvfp4_experts::prompt_body<M, EPI, 4, 1, WN>(X, x_stride, slots, W, scale, KG, NB, items, counts, members,    \
-                                                    out, N, limit);                                                  \
+                                                    out, N, limit, skip);                                            \
   }
 TF_NVFP4_PROMPT(tf_nvfp4_prompt_relu2, 1, 1, 8)
 TF_NVFP4_PROMPT(tf_nvfp4_prompt_swiglu, 2, 2, 4)
