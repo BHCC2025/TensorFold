@@ -6,14 +6,16 @@ const glue = @import("cuda_glue.zig");
 const experts = @import("cuda_experts.zig");
 const b16 = @import("cuda_b16.zig");
 
-/// One MoE layer on a rank: router (bf16 [count][dims]) and fp32 bias, routed experts, shared [gate | up] and down.
+/// One MoE layer on a rank: router (bf16) and fp32 bias, routed experts, shared [gate | up] (or EXL3's two) and down.
 pub const Layer = struct {
     router: u64,
     bias: u64,
     routed: cuda.experts.Layer,
     count: usize,
     shared_gu: u64,
-    shared_down: u64,
+    shared_gate: ?cuda.qlinear.Weight = null,
+    shared_up: ?cuda.qlinear.Weight = null,
+    shared_down: b16.Proj,
     shared: usize,
     top_k: usize,
     scale: f32,
@@ -64,9 +66,16 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const slots = l.top_k + 1;
     const n = hi - lo;
     const eb: usize = if (prompt) 2 else 4; // the slot rows: bf16 in a prompt chunk
-    try b16.matmul(k.set, stream, x + lo * x_stride * 2, x_stride, l.shared_gu, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+    const gu = s.sgu + lo * 2 * l.shared * 2;
+    if (l.shared_gate) |g| {
+        // EXL3: gate and up apart, each through s.sact into its half of the [gate | up] rows
+        for ([_]cuda.qlinear.Weight{ g, l.shared_up orelse return error.MissingSharedUp }, 0..) |w, j| {
+            try b16.proj(k.set, stream, x + lo * x_stride * 2, x_stride, .{ .q = w }, s.sact + lo * l.shared * 2, s.mm_part, n, l.shared, d, false);
+            try b16.copyRows(k.set, stream, s.sact + lo * l.shared * 2, l.shared * 2, gu + j * l.shared * 2, 2 * l.shared * 2, n, l.shared * 2);
+        }
+    } else try b16.matmul(k.set, stream, x + lo * x_stride * 2, x_stride, l.shared_gu, gu, s.mm_part, n, 2 * l.shared, d, false);
     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
-    try b16.matmul(k.set, stream, s.sact + lo * l.shared * 2, l.shared, l.shared_down, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+    try b16.proj(k.set, stream, s.sact + lo * l.shared * 2, l.shared, l.shared_down, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
     var a: cuda.Args = .{};
     a.add(s.sy + lo * d * 4);
     a.add(s.ey + lo * slots * d * eb);

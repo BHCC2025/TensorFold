@@ -46,7 +46,7 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
-fn b16Shapes(w: *const weights.Weights) [10][2]usize {
+fn b16Shapes(w: *const weights.Weights) [11][2]usize {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
@@ -56,6 +56,7 @@ fn b16Shapes(w: *const weights.Weights) [10][2]usize {
         .{ c.q_lora + c.kv_lora, c.hidden }, .{ s.mla.len() * c.nope, c.q_lora },  .{ c.i_dim + c.i_heads, c.hidden },
         .{ c.i_heads * c.i_dim, c.q_lora },  .{ c.hidden, s.mla.len() * c.v_dim }, .{ 2 * s.shared.len(), c.hidden },
         .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
+        .{ 2 * c.kda_dim + s.kda.len(), c.hidden }, // EXL3: [f_a | g_a | b] apart from qkv
     };
 }
 
@@ -160,6 +161,7 @@ pub const Buffers = struct {
             rows * (D / 64) * 4,  (if (prefill) 1 else rows) * s.vocab.len() * 2,
             rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
+            if (w.quantizedAttention()) rows * 3 * n * 2 else 4, // the KDA projection's staging (EXL3)
         };
         var p: [sizes.len]u64 = undefined;
         const a = try arena(d, &sizes, &p);
@@ -178,7 +180,7 @@ pub const Buffers = struct {
             .hcpart = p[6],
             .gathered = p[7],
             .kproj = p[8],
-            .kda = .{ .p = 0, .ka = p[9], .kg = p[10], .saves = .{ .out = p[11], .state_out = 0, .k = p[12], .v = p[13], .g = p[14], .b = p[15] }, .wide = .{ .q = p[16], .y = p[17] }, .mm_part = p[42] },
+            .kda = .{ .p = 0, .ka = p[9], .kg = p[10], .saves = .{ .out = p[11], .state_out = 0, .k = p[12], .v = p[13], .g = p[14], .b = p[15] }, .wide = .{ .q = p[16], .y = p[17] }, .mm_part = p[42], .tmp = p[71] },
             .dsa = .{
                 .dp = p[18],
                 .qr = p[19],

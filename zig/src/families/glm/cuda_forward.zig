@@ -31,6 +31,8 @@ pub const Modules = struct {
     kda: kda.Kernels,
     lane: cuda.qmmf.Lane, // the NVFP4 linears' decode rows (qlinear)
     prompt: cuda.nvfp4.Prompt, // and their prompt rows
+    exl3_mod: cuda.Module,
+    exl3: cuda.exl3_linear.Kernels, // EXL3 checkpoints' projections (qlinear)
     experts: experts.Kernels,
     copy_rows: cuda.Function,
     put_slot: cuda.Function,
@@ -51,6 +53,10 @@ pub const Modules = struct {
         errdefer m.lane.unload();
         m.prompt = try cuda.nvfp4.Prompt.load(d);
         errdefer m.prompt.unload();
+        m.exl3_mod = try cuda.Module.load(d, k.exl3);
+        errdefer m.exl3_mod.unload();
+        m.exl3 = try cuda.exl3_linear.Kernels.resolve(d, m.exl3_mod, 16384);
+        errdefer m.exl3.deinit();
         m.kda = try kda.Kernels.load(m.mods[0]);
         m.experts = try experts.Kernels.load(d, m.mods[2], @intCast(try ctx.attribute(.multiprocessor_count)));
         errdefer m.experts.unload();
@@ -76,6 +82,8 @@ pub const Modules = struct {
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
         m.prompt.unload();
+        m.exl3.deinit();
+        m.exl3_mod.unload();
         m.experts.unload();
         m.* = undefined;
     }
@@ -160,7 +168,12 @@ pub const Forward = struct {
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue };
+        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows };
+    }
+
+    /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.
+    pub fn linear(f: *const Forward) cuda.qlinear.Linear {
+        return .{ .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = &f.m.exl3 };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
@@ -244,7 +257,7 @@ pub const Forward = struct {
     }
 
     fn mlpKernels(f: *const Forward) mlp.Kernels {
-        return .{ .set = f.set(), .linear = .{ .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt }, .copy_rows = f.m.copy_rows };
+        return .{ .set = f.set(), .linear = f.linear(), .copy_rows = f.m.copy_rows };
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
@@ -494,7 +507,7 @@ pub const Forward = struct {
             try glue.rmsnorm(f.set(), f.stream, b.hidden, c.hidden, r.w.norm, b.fnormed, c.hidden, b.fxs, c.eps, R, c.hidden);
             const head_rows: usize = if (b.prefill) 1 else R;
             const first = if (b.prefill) R - 1 else 0;
-            try b16.matmul(f.set(), f.stream, b.fnormed + first * c.hidden * 2, c.hidden, r.w.head, b.logits, b.kda.mm_part, head_rows, r.w.share.vocab.len(), c.hidden, false);
+            try b16.proj(f.set(), f.stream, b.fnormed + first * c.hidden * 2, c.hidden, r.w.head, b.logits, b.kda.mm_part, head_rows, r.w.share.vocab.len(), c.hidden, false);
         }
     }
 
@@ -515,7 +528,7 @@ pub const Forward = struct {
             if (r.st.mtp_len == 0) try f.d.check(f.d.api.cuMemsetD8Async(b.me, 0, D * 2, f.stream.handle), "cuMemsetD8Async"); // position 0's embedding is zeroed
             try glue.rmsnorm(f.set(), f.stream, b.me, D, m.enorm, b.mcat, 2 * D, null, c.eps, n, D);
             try glue.rmsnorm(f.set(), f.stream, b.hin, D, m.hnorm, b.mcat + D * 2, 2 * D, null, c.eps, n, D);
-            try b16.matmul(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
+            try b16.proj(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
             try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
             try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
@@ -534,7 +547,8 @@ pub const Forward = struct {
             const b = r.b;
             try glue.residualAdd(f.set(), f.stream, b.mx, b.mx, b.gathered, n, D, r.w.share.world);
             try glue.rmsnorm(f.set(), f.stream, b.mx + (n - 1) * D * 2, D, m.norm, b.fnormed, D, b.fxs, c.eps, 1, D);
-            if (!b.prefill) try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, m.draft, b.logits, 1);
+            if (b.prefill) continue;
+            if (m.draft) |dq| try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, dq, b.logits, 1) else try b16.proj(f.set(), f.stream, b.fnormed, D, r.w.head, b.logits, b.kda.mm_part, 1, r.w.share.vocab.len(), D, false);
         }
     }
 

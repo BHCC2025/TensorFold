@@ -4,7 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 
 /// What the forward's kernels launch from: our glue's functions.
-pub const Set = struct { glue: *const Kernels };
+pub const Set = struct { glue: *const Kernels, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null };
 
 /// Our glm_glue.cu's functions.
 pub const Kernels = struct {

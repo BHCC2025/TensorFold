@@ -90,6 +90,36 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u6
     if (sk > 1) try glue.sliceSum(set, stream, part, out, m * n, sk, wide);
 }
 
+/// A projection: BF16 (bmm), or a quantized qlinear weight (an EXL3 checkpoint quantizes what NVFP4 keeps in BF16).
+pub const Proj = union(enum) { b16: u64, q: cuda.qlinear.Weight };
+
+/// matmul for either kind: a quantized weight takes qlinear's decode rows under rows_from rows, its prompt rows above.
+pub fn proj(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, p: Proj, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+    switch (p) {
+        .b16 => |w| return matmul(set, stream, x, x_stride, w, out, part, m, n, k, wide),
+        .q => |w| {
+            if (w.outputs() != n or w.inputs() != k) return error.ShapeMismatch;
+            const in: cuda.qlinear.Rows = .{ .x = x, .ldx = x_stride };
+            const l = set.linear;
+            if (m >= rows_from) return if (wide) l.promptF32(stream, w, in, out, m) else l.prompt(stream, w, in, out, m);
+            return if (wide) l.decodeF32(stream, w, in, out, m) else l.decode(stream, w, in, out, m);
+        },
+    }
+}
+
+/// `rows` rows of `bytes` from `src` into `dst`, each side's rows its stride apart in bytes (tf_glm_copy_rows).
+pub fn copyRows(set: glue.Set, stream: cuda.Stream, src: u64, src_stride: usize, dst: u64, dst_stride: usize, rows: usize, bytes: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(src);
+    a.add(@as(c_longlong, @intCast(src_stride)));
+    a.add(dst);
+    a.add(@as(c_longlong, @intCast(dst_stride)));
+    a.add(@as(c_int, @intCast(rows)));
+    a.add(@as(c_int, @intCast(bytes)));
+    const f = set.copy_rows orelse return error.NoCopyRows;
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((rows * bytes + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+}
+
 /// qmm.group_sums: (m, k) bf16 rows (stride `x_stride`) -> (m, k / 64) fp32 sums of each 64 inputs.
 pub fn groupSums(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, xs: u64, m: usize, k: usize) !void {
     var a: cuda.Args = .{};

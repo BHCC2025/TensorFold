@@ -1,4 +1,4 @@
-//! A TP rank's GLM-5.3-Flash weights on CUDA (the Python family's weights.load, NVFP4), named by its paths for digests.
+//! A TP rank's GLM-5.3-Flash weights on CUDA (the Python family's weights.load, NVFP4 or EXL3), named by its paths.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -12,9 +12,11 @@ const mlp = @import("cuda_mlp.zig");
 const moe = @import("cuda_moe.zig");
 const quant = @import("cuda_quant.zig");
 const q4 = @import("cuda_q4.zig");
+const b16 = @import("cuda_b16.zig");
+const x3 = @import("cuda_weights_exl3.zig");
 
 const Tensor = core.checkpoint.Tensor;
-const prefix = "model.language_model.";
+pub const prefix = "model.language_model.";
 
 /// A hyper-connection site: fn bf16 [s (s + 2)][s d], base and scale widened to fp32.
 pub const Hc = struct { fn_w: u64, base: u64, scale: u64 };
@@ -24,8 +26,8 @@ pub const Ffn = union(enum) { dense: mlp.Layer, moe: moe.Layer };
 
 pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, post_norm: u64, mixer: Mixer, ffn: Ffn };
 
-/// The MTP head (weights.MTPW): norms, eh_proj, a DSA + MoE layer (NVFP4 experts), shared_head.norm, 4-bit draft head.
-pub const Mtp = struct { enorm: u64, hnorm: u64, eh: u64, norm: u64, layer: Layer, draft: q4.Q4 };
+/// The MTP head (weights.MTPW): norms, eh_proj, a DSA + MoE layer, shared_head.norm, 4-bit draft head (EXL3: the head).
+pub const Mtp = struct { enorm: u64, hnorm: u64, eh: b16.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
 
 /// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
 pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null };
@@ -40,7 +42,8 @@ pub const Weights = struct {
     embed: u64 = 0, // bf16 [vocab][dims]
     layers: []Layer = &.{},
     norm: u64 = 0,
-    head: u64 = 0, // bf16 [share.vocab][dims]
+    head: b16.Proj = .{ .b16 = 0 }, // bf16 [share.vocab][dims], or EXL3
+    exl3: bool = false, // an EXL3 checkpoint: the attention, shared expert, dense MLP and head quantized
     mtp: ?Mtp = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
@@ -52,6 +55,11 @@ pub const Weights = struct {
         w.named.deinit(w.gpa);
         w.gpa.free(w.layers);
         w.* = undefined;
+    }
+
+    /// Whether the attention projections are quantized (an EXL3 checkpoint), so the KDA projection stages its rows.
+    pub fn quantizedAttention(w: *const Weights) bool {
+        return w.exl3;
     }
 
     /// The upload named `name` (the Python family's attribute path), or null.
@@ -68,7 +76,7 @@ fn toBf16(v: f32) u16 {
     return @intCast((b + 0x7fff + ((b >> 16) & 1)) >> 16);
 }
 
-const Loader = struct {
+pub const Loader = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
     stream: cuda.Stream,
@@ -79,13 +87,13 @@ const Loader = struct {
     host: std.ArrayList(u8) = .empty,
     name_buf: [192]u8 = undefined,
 
-    fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
+    pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
         const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
         return L.ck.get(name);
     }
 
     /// The host bytes gathered so far uploaded as one tensor named `fmt`.
-    fn put(L: *Loader, comptime fmt: []const u8, args: anytype) !u64 {
+    pub fn put(L: *Loader, comptime fmt: []const u8, args: anytype) !u64 {
         const b = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
         try L.w.buffers.append(L.gpa, b);
         try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, fmt, args), .ptr = b.ptr, .len = b.len });
@@ -103,6 +111,7 @@ const Loader = struct {
             const v: f32 = switch (t.dtype) {
                 .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
                 .f32 => std.mem.bytesToValue(f32, t.bytes[4 * i ..][0..4]),
+                .f16 => @floatCast(std.mem.bytesToValue(f16, t.bytes[2 * i ..][0..2])),
                 else => return error.UnexpectedTensor,
             };
             switch (to) {
@@ -114,13 +123,13 @@ const Loader = struct {
     }
 
     /// Rows [lo, hi) of `t`'s outermost axis (`total` long; a vector's elements): split.py's "row" cut.
-    fn rows(L: *Loader, t: Tensor, lo: usize, hi: usize, total: usize, to: core.checkpoint.DType) !void {
+    pub fn rows(L: *Loader, t: Tensor, lo: usize, hi: usize, total: usize, to: core.checkpoint.DType) !void {
         const per = t.numel() / total;
         if (per * total != t.numel()) return error.UnexpectedTensor;
         try L.add(t, lo * per, hi * per, to);
     }
 
-    fn whole(L: *Loader, t: Tensor, to: core.checkpoint.DType) !void {
+    pub fn whole(L: *Loader, t: Tensor, to: core.checkpoint.DType) !void {
         try L.add(t, 0, t.numel(), to);
     }
 
@@ -142,6 +151,7 @@ const Loader = struct {
 
     /// weights.load's kda(i): [q | k | v | f_a | g_a | b], f_b/g_b by heads, o by columns, conv taps, A_log, dt_bias.
     fn kda(L: *Loader, i: u32) !kda_block.Layer {
+        if (L.w.exl3) return x3.kda(L, i);
         const c = &L.w.config;
         const h = L.w.share.kda;
         const dk = c.kda_dim;
@@ -164,7 +174,7 @@ const Loader = struct {
         const norm = try L.put("layers.{d}.kda.norm", .{i});
         try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * dk, h.hi * dk, .bf16);
         const o = try L.put("layers.{d}.kda.o", .{i});
-        return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+        return .{ .proj = proj, .fb = fb, .gb = gb, .o = .{ .b16 = o }, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
     }
 
     /// weights.load's dsa(i) (latent): [q_a | kv_a], norms, q_b by heads, kv_b as wk/wv (AbsorbW), o by cols, indexer.
@@ -172,14 +182,25 @@ const Loader = struct {
         const c = &L.w.config;
         const h = L.w.share.mla;
         const qk = c.nope;
-        inline for (.{ "q_a_proj", "kv_a_proj_with_mqa" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ ".weight", .{i}), .bf16);
-        const proj = try L.put("layers.{d}.dsa.proj", .{i});
+        const ex = L.w.exl3;
+        var q_a: ?cuda.qlinear.Weight = null;
+        var kv_a: ?cuda.qlinear.Weight = null;
+        var proj: u64 = 0;
+        if (ex) {
+            q_a = try x3.whole(L, "layers.{d}.self_attn.q_a_proj", i);
+            kv_a = try x3.whole(L, "layers.{d}.self_attn.kv_a_proj_with_mqa", i);
+        } else {
+            inline for (.{ "q_a_proj", "kv_a_proj_with_mqa" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ ".weight", .{i}), .bf16);
+            proj = try L.put("layers.{d}.dsa.proj", .{i});
+        }
         try L.whole(try L.get("layers.{d}.self_attn.q_a_layernorm.weight", .{i}), .bf16);
         const q_norm = try L.put("layers.{d}.dsa.q_norm", .{i});
         try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
         const kv_norm = try L.put("layers.{d}.dsa.kv_norm", .{i});
-        try L.rows(try L.get("layers.{d}.self_attn.q_b_proj.weight", .{i}), h.lo * qk, h.hi * qk, c.mla_heads * qk, .bf16);
-        const q_b = try L.put("layers.{d}.dsa.q_b", .{i});
+        const q_b: b16.Proj = if (ex) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.q_b_proj", i, 0, 0, &.{.{ .lo = h.lo * qk, .hi = h.hi * qk }}) } else blk: {
+            try L.rows(try L.get("layers.{d}.self_attn.q_b_proj.weight", .{i}), h.lo * qk, h.hi * qk, c.mla_heads * qk, .bf16);
+            break :blk .{ .b16 = try L.put("layers.{d}.dsa.q_b", .{i}) };
+        };
         const kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
         const per = qk + c.v_dim; // a head's kv_b rows: its keys, then its values
         const total = c.mla_heads * per;
@@ -187,12 +208,16 @@ const Loader = struct {
         const wk = try L.put("layers.{d}.dsa.absorb.wk", .{i});
         for (h.lo..h.hi) |head| try L.rows(kv_b, head * per + qk, (head + 1) * per, total, .bf16);
         const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
-        try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * c.v_dim, h.hi * c.v_dim, .bf16);
-        const o = try L.put("layers.{d}.dsa.o", .{i});
+        const o: b16.Proj = if (ex) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.o_proj", i, h.lo * c.v_dim, h.hi * c.v_dim, &.{.{ .lo = 0, .hi = c.hidden }}) } else blk: {
+            try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * c.v_dim, h.hi * c.v_dim, .bf16);
+            break :blk .{ .b16 = try L.put("layers.{d}.dsa.o", .{i}) };
+        };
         inline for (.{ "wk", "weights_proj" }) |x| try L.whole(try L.get("layers.{d}.self_attn.indexer." ++ x ++ ".weight", .{i}), .bf16);
         const kw = try L.put("layers.{d}.dsa.index.kw", .{i});
-        try L.whole(try L.get("layers.{d}.self_attn.indexer.wq_b.weight", .{i}), .bf16);
-        const qb = try L.put("layers.{d}.dsa.index.qb", .{i});
+        const qb: b16.Proj = if (ex) .{ .q = try x3.whole(L, "layers.{d}.self_attn.indexer.wq_b", i) } else blk: {
+            try L.whole(try L.get("layers.{d}.self_attn.indexer.wq_b.weight", .{i}), .bf16);
+            break :blk .{ .b16 = try L.put("layers.{d}.dsa.index.qb", .{i}) };
+        };
         try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
         const ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
         try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.bias", .{i}), .bf16);
@@ -203,6 +228,8 @@ const Loader = struct {
         const ape = try L.put("layers.{d}.dsa.index.ape", .{i});
         return .{
             .proj = proj,
+            .q_a = q_a,
+            .kv_a = kv_a,
             .q_norm = q_norm,
             .kv_norm = kv_norm,
             .q_b = q_b,
@@ -258,10 +285,18 @@ const Loader = struct {
         const c = &L.w.config;
         const s = L.w.share.dense;
         const d = c.hidden;
+        if (L.w.exl3) return .{
+            .gate = try x3.layerMatrix(L, "layers.{d}.mlp.gate_proj", i, 0, 0, &.{s}),
+            .up = try x3.layerMatrix(L, "layers.{d}.mlp.up_proj", i, 0, 0, &.{s}),
+            .down = try x3.layerMatrix(L, "layers.{d}.mlp.down_proj", i, s.lo, s.hi, &.{.{ .lo = 0, .hi = d }}),
+            .width = s.len(),
+            .dims = d,
+            .limit = c.swiglu_limit,
+        };
         return .{
-            .gate = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d),
-            .up = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d),
-            .down = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi),
+            .gate = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) },
+            .up = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) },
+            .down = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi) },
             .width = s.len(),
             .dims = d,
             .limit = c.swiglu_limit,
@@ -335,6 +370,7 @@ const Loader = struct {
 
     /// weights.load's moe(i) on NVFP4: router and bias, routed experts as Experts4, the BF16 shared expert's share.
     fn moeLayer(L: *Loader, i: u32) !moe.Layer {
+        if (L.w.exl3) return x3.moe(L, i);
         const c = &L.w.config;
         const d: usize = c.hidden;
         const cut = L.w.share.moe;
@@ -394,7 +430,7 @@ const Loader = struct {
             .routed = .{ .format = .nvfp4, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit },
             .count = count,
             .shared_gu = gu,
-            .shared_down = sd,
+            .shared_down = .{ .b16 = sd },
             .shared = sh.len(),
             .top_k = c.topk,
             .scale = c.routed_scale,
@@ -413,6 +449,14 @@ const Loader = struct {
         const none: Hc = .{ .fn_w = 0, .base = 0, .scale = 0 };
         const layer_w: Layer = .{ .index = i, .attn_hc = none, .ffn_hc = none, .in_norm = in_norm, .post_norm = post_norm, .mixer = .{ .mla = try L.dsa(i) }, .ffn = .{ .moe = try L.moeLayer(i) } };
         L.ck.release();
+        if (L.w.exl3) {
+            var o3: [3]u64 = undefined;
+            for (&o3, [_][]const u8{ "enorm.weight", "hnorm.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "norm" }) |*p, name, what| {
+                try L.whole(try L.ck.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
+                p.* = try L.put("mtp.{s}", .{what});
+            }
+            return .{ .enorm = o3[0], .hnorm = o3[1], .eh = .{ .q = try x3.whole(L, "layers.{d}.eh_proj", i) }, .norm = o3[2], .layer = layer_w, .draft = null };
+        }
         var out: [4]u64 = undefined;
         for (&out, [_][]const u8{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "eh", "norm" }) |*p, name, what| {
             try L.whole(try L.ck.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
@@ -430,7 +474,7 @@ const Loader = struct {
             b.* = try L.scratch(size);
             made += 1;
         }
-        try quant.q4(qk, L.stream, L.w.head, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
+        try quant.q4(qk, L.stream, L.w.head.b16, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
         var tiled: [3]u64 = undefined;
         for (&tiled, q4.bytes(n, k), [_][]const u8{ "words", "scales", "biases" }) |*p, size, what| {
             const b = try cuda.DeviceBuffer.alloc(L.d, size);
@@ -441,7 +485,7 @@ const Loader = struct {
         const draft: q4.Q4 = .{ .w = tiled[0], .s = tiled[1], .b = tiled[2], .n = n, .k = k, .npad = q4.npadOf(n) };
         try q4.pack(tk, L.stream, raw[0].ptr, raw[1].ptr, raw[2].ptr, draft);
         try L.stream.synchronize();
-        return .{ .enorm = out[0], .hnorm = out[1], .eh = out[2], .norm = out[3], .layer = layer_w, .draft = draft };
+        return .{ .enorm = out[0], .hnorm = out[1], .eh = .{ .b16 = out[2] }, .norm = out[3], .layer = layer_w, .draft = draft };
     }
 
     fn layer(L: *Loader, i: u32) !Layer {
@@ -475,6 +519,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     defer head_ck.close();
     var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
     defer L.host.deinit(gpa);
+    w.exl3 = ck.has(prefix ++ "layers.0.self_attn.qkv_proj.trellis");
     w.layers = try gpa.alloc(Layer, layers.len);
     for (layers, w.layers) |i, *l| {
         if (i >= c.layers) return error.BadLayer;
@@ -485,8 +530,14 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     w.embed = try L.put("embed", .{});
     try L.whole(try L.get("norm.weight", .{}), .bf16);
     w.norm = try L.put("norm", .{});
-    try L.rows(try head_ck.get("lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
-    w.head = try L.put("head", .{});
+    if (w.exl3) {
+        w.head = .{ .q = try x3.matrix(&L, &head_ck, "lm_head", 0, 0, &.{.{ .lo = share.vocab.lo, .hi = share.vocab.hi }}) };
+        // EXL3 keeps the MTP layer in mtp.safetensors or, in some quants, in the shards
+        if (with_mtp and c.mtp > 0) ck.add(dir, "mtp.safetensors") catch |e| if (e != error.FileNotFound) return e;
+    } else {
+        try L.rows(try head_ck.get("lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
+        w.head = .{ .b16 = try L.put("head", .{}) };
+    }
     if (with_mtp and c.mtp > 0) w.mtp = try L.mtp();
     return w;
 }
