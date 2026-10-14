@@ -84,7 +84,10 @@ fn spirv(b: *std.Build, ocloc: []const u8, device: []const u8, k: Kernel) std.Bu
     const run = b.addSystemCommand(&.{ ocloc, "compile", "-device", device, "-spv_only", "-output", k.name, "-output_no_suffix", "-q" });
     // ocloc builds from a copy of the source, so the header directory is named (the Run step's cwd is the build root)
     if (k.options.len > 0) run.addArgs(&.{ "-options", if (k.include) b.fmt("{s} -I zig/kernels/xpu", .{k.options}) else k.options });
-    if (k.include) run.addFileInput(b.path("zig/kernels/xpu/ggml_tables.h"));
+    if (k.include) {
+        run.addFileInput(b.path("zig/kernels/xpu/ggml_tables.h"));
+        run.addFileInput(b.path("zig/kernels/xpu/ggml_tables_iq1s.h"));
+    }
     run.addArg("-file");
     run.addFileArg(b.path(b.fmt("zig/kernels/xpu/{s}.cl", .{k.src orelse k.name})));
     run.addArg("-out_dir");
