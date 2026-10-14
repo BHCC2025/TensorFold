@@ -210,7 +210,8 @@ Everything below was measured on the same card, host and Zig as above, with the 
 - GGUF block types: Q2_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and IQ4_NL, with bf16/fp16/f32 tensors.
 - Context: at most 131,072 positions. The model's configuration names 262,144; the engine does not hold that and refuses a larger `--context`
   with a message saying so. No claim is made for the 262,144 window.
-- KV cache: q8 is the default (`--kv` in the CLI, the environment variable `TENSORFOLD_XPU_KV` for the server); bf16 and q4 are opt-in.
+- KV cache: bf16 is the default (`--kv` in the CLI, the environment variable `TENSORFOLD_XPU_KV` for the server); q8 and q4 are opt-in.
+  The MTP head's cache follows the target's format (`MTP_KV` overrides it).
   A paired KL study of the three formats on recipe C (mixed-document corpus, 16K and 32K chunks, 5 chunks at 32K, no needle
   retrieval) gave, against the bf16 cache: q8 -0.0002 at 16K and 32K (within one standard error, saving 0.5 to 1.0 GB); q4 +0.0024 (+3.8%)
   at 16K and +0.0032 (+7.4%) at 32K, with the same-top-token rate 0.2 points lower (saving 0.8 to 1.55 GB). q4 is an opt-in mode for pushing

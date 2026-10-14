@@ -24,7 +24,7 @@ pub fn setOverride(m: ?Mode) void {
     override = m;
 }
 
-/// KV format of the MTP block (env MTP_KV = bf16 | q8 | q4; default: target's quantized mode, else q4 from 16384).
+/// KV format of the MTP block (env MTP_KV = bf16 | q8 | q4; default: the target's format).
 pub fn mtpMode(cap: u32) Mode {
     if (std.c.getenv("MTP_KV")) |v| {
         const s = std.mem.span(v);
@@ -32,8 +32,8 @@ pub fn mtpMode(cap: u32) Mode {
         if (std.mem.eql(u8, s, "q8")) return .q8;
         if (std.mem.eql(u8, s, "q4")) return .q4;
     }
-    if (kvMode() != .bf16) return kvMode();
-    return if (cap > 16384) .q4 else .bf16;
+    _ = cap;
+    return kvMode();
 }
 
 /// Picks the KV cache format before the model loads (`--kv`); it wins over the ARC_KV environment variable.

@@ -16,8 +16,8 @@ pub const Options = struct {
     /// Positions of the KV caches (prompt and generated tokens).
     context: usize = 4096,
     progress: bool = false,
-    /// KV cache format (`--kv`); q8 and q4 need no more than the long-context kernels.
-    kv: al.Mode = .q8,
+    /// KV cache format (`--kv`): bf16 by default; q8 and q4 are opt-in.
+    kv: al.Mode = .bf16,
     /// Rows of the prompt windows when more than 16 (`--prefill`).
     window_rows: u32 = 0,
 };

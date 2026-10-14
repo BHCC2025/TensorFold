@@ -17,7 +17,7 @@ const usage =
     \\       tensorfold-xpu devices
     \\  --force   teacher forcing: feed these ids after the prompt, one step per id (the end token never stops)
     \\  --prefill ROWS  the prompt in windows of ROWS tokens (16 and up; auto: the largest of 2048/1024/512/256 that fits the memory left); --spec K  speculative decoding, K drafts a window, the output is the plain greedy run's
-    \\  --kv      KV cache format, default q8; q4 holds more context at a cost (the model's limit is 131072 positions)
+    \\  --kv      KV cache format, default bf16; q8 and q4 are opt-in and hold more context at a cost (the model's limit is 131072 positions)
     \\  --logits  print each step's five largest logits ("step N pos P top5: id:logit ...")
     \\  Serial decode only: MTP drafts, sampling and the CUDA engine's graph and kernel options are not available here.
     \\
@@ -42,7 +42,7 @@ const Options = struct {
     drafter: Drafter = .copy,
     mtp_from: ?[]const u8 = null,
     min_n: usize = 3,
-    kv: Kv = .q8,
+    kv: Kv = .bf16,
 };
 
 const Drafter = enum { copy, mtp, auto };
@@ -276,7 +276,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, e: anytype, o: Options) !u8 {
         return 2;
     }
     if (comptime !@hasField(@TypeOf(e.*), "stats")) {
-        if (o.spec_k > 0 or o.drafter != .copy or o.kv != .q8 or o.mtp_from != null) {
+        if (o.spec_k > 0 or o.drafter != .copy or o.kv != .bf16 or o.mtp_from != null) {
             std.debug.print("--spec, --drafter, --mtp-from and --kv are available for Qwen models only\n", .{});
             return 2;
         }
