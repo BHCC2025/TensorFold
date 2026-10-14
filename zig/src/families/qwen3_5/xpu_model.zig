@@ -135,6 +135,13 @@ pub const Model = struct {
         if (inplace) m.pos += @intCast(tokens.len);
     }
 
+    /// Prompt rows in place: any piece size takes the prompt-chunk kernels (--prefill > 16); decode uses forwardRows.
+    pub fn promptRows(m: *Model, tokens: []const u32, head_rows: u32) !void {
+        m.win.prompt = true;
+        defer m.win.prompt = false;
+        try m.forwardRows(tokens, head_rows, true);
+    }
+
     /// lm_head over n <= 16 hidden rows from row0 of the last window run with qwen_win.keep_hidden.
     pub fn headBatch(m: *Model, row0: u32, n: u32) !void {
         try m.win.headBatch(m.head, row0, n, m.bf16_logits);

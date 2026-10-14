@@ -275,7 +275,7 @@ pub fn prefill(m: *model.Model, mt: *Mtp, prompt: []const u32, k: usize, drafts:
         const rows = @min(R, prompt.len - t);
         const last = t + rows == prompt.len;
         // the last window gets the logits of its last row; the others keep their normalised rows for the head
-        try m.forwardRows(prompt[t .. t + rows], if (last) 1 else qw.keep_hidden, true);
+        try m.promptRows(prompt[t .. t + rows], if (last) 1 else qw.keep_hidden);
         if (last) {
             var g: [1]i32 = undefined;
             try m.rowArgmax(&g);

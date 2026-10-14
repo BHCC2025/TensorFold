@@ -307,13 +307,12 @@ tokens of a public text), 16 generated tokens, windows of 1,024 rows, bf16 KV; t
   at 16 to 2048 rows (`tf-xpu-qwen_gdnrows-test`).
 - Drafted == plain: `tools/zig/xpu_spec_identity.sh`, 7 prompts, 299 tokens, k=4, token for token: EXL3 mtp, GGUF IQ3_S mtp, MLX mtp with the EXL3 head, MLX copy drafts and EXL3 auto all pass.
 - The queued-forward slot ring equals synced forwards (0 of 248,320 logits differ).
-- Prompt chunk sizes (`tf-xpu-qwen_seam-test`, 640 tokens of real text): MLX chunks of 64, 128 and 512 give byte-identical conv and SSM state, KV bytes and decode
-  logits. EXL3 chunks of 64 and 128 are byte-identical; chunks of 512 differ from them. The cause is a named change of GEMM path at 256 rows: below it the EXL3
-  projections use the decode kernels in 16-row steps, from 256 rows they use the matrix-engine prefill GEMM, and the fp16 gate projections switch to a prefill
-  GEMM at the same size. With both switches removed in a scratch build, chunks of 64, 128 and 512 agree bit for bit, so these two are the whole cause; the unified path
-  was not adopted because it would change the bits of every prompt chunk above 16 rows. Measured size: decode logits after the prompt differ between chunks of
-  128 and 512 by at most 2.07e-1 (largest logit 22.8), top-1 equal in 7 of 8 steps. The test accepts that difference only where told (`differ=256`) and fails otherwise.
-  The same difference appeared in the earlier clean-clone runs (EXL3 chunk 64 against 512 differed there too), so it is not new.
+- Prompt chunk sizes (`tf-xpu-qwen_seam-test`, real text; the test takes a checkpoint directory or a `.gguf` file): a prompt's bits do not
+  depend on how it is cut. Every prompt piece, whatever its size, takes the prompt kernels (`Model.promptRows`), so EXL3 and fp16 projections use
+  their prefill GEMMs at every chunk size, and a last piece of 16 rows or fewer runs as a prompt chunk too. EXL3, MLX 4-bit, Q5_K_XL and IQ3_S:
+  640 tokens in chunks of 64, 128 and 512, and 648 tokens (an 8-row last piece) in chunks of 64, 128 and 512, give byte-identical conv and SSM
+  state, KV bytes and decode logits; EXL3 also at 600 tokens in chunks of 17, 64, 100, 256 and 512. Decode and verify windows (2 to 16 rows)
+  stay on the decode kernels and equal one-row decode (above). Without prompt windows (`--prefill` 16 or unset) every row takes the decode kernels.
 - Prefill against row by row is not bit-identical by design (different accumulation order): after 640 tokens, 74% to 99% of the state elements differ at rounding scale
   (worst conv difference 0.31 against a maximum of 62), and the next 8 decode steps differ by up to 0.39 in logit on MLX (top-1 equal in 8 of 8) and 0.27 on EXL3 (7 of 8).
 - FP64 reference per projection class (`tf-xpu-qwen_fp64-test`, MLX 4-bit, real weights read from the checkpoint file, first and last layer of each kind, 2,048 evenly spread columns at most):

@@ -7,6 +7,7 @@ const ld = @import("xpu").loader;
 const cfgm = @import("qwen_xpu").config;
 const model = @import("qwen_xpu").model;
 const qw = @import("qwen_xpu").win;
+const qg = @import("qwen_xpu").gguf;
 
 const gpa = std.heap.page_allocator;
 const steps = 8;
@@ -108,19 +109,22 @@ pub fn main(init: std.process.Init) !void {
     const dir = args[1];
     const n: usize = if (args.len > 2) try std.fmt.parseInt(usize, args[2], 10) else 640;
     var chunks: std.ArrayList(u32) = .empty;
-    // differ=N: chunk sizes of N rows and up may differ from smaller ones (another GEMM path); others must agree
-    var allow_from: u32 = std.math.maxInt(u32);
     for (args[@min(args.len, 3)..]) |a| {
-        if (std.mem.startsWith(u8, a, "differ=")) allow_from = try std.fmt.parseInt(u32, a[7..], 10) else try chunks.append(gpa, try std.fmt.parseInt(u32, a, 10));
+        try chunks.append(gpa, try std.fmt.parseInt(u32, a, 10));
     }
     if (chunks.items.len == 0) try chunks.appendSlice(gpa, &.{ 128, 512 });
     var big: u32 = 16;
     for (chunks.items) |c| big = @max(big, c);
     qw.default_rows = big;
-    const cfg = try cfgm.parse(gpa, try ld.readFile(gpa, dir, "config.json"));
     var r = try rt.open();
     defer r.deinit();
-    var l = try ld.Loader.init(gpa, &r, dir);
+    // DIR is a checkpoint directory or a .gguf file
+    const is_gguf = std.mem.endsWith(u8, dir, ".gguf");
+    var l = if (is_gguf) try ld.Loader.initBare(gpa, &r) else try ld.Loader.init(gpa, &r, dir);
+    const cfg: std.json.Parsed(cfgm.Config) = if (is_gguf) blk: {
+        const meta = try qg.readHeader(gpa, &l, dir);
+        break :blk .{ .arena = undefined, .value = try qg.config(gpa, &l, meta) };
+    } else try cfgm.parse(gpa, try ld.readFile(gpa, dir, "config.json"));
     var m = try model.Model.load(gpa, &r, &l, cfg.value, @intCast(n + 64));
     m.bf16_logits = true;
     const zeros = try gpa.alloc(u8, model.state_bytes);
@@ -157,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
         var i: usize = 0;
         while (i < n) {
             const rows = @min(c, n - i);
-            try m.forwardRows(ids[i .. i + rows], 0, true);
+            try m.promptRows(ids[i .. i + rows], 0);
             i += rows;
         }
         const snap = try snapshot(&r, &m);
@@ -171,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         i = 0;
         while (i < n) {
             const rows = @min(c, n - i);
-            try m.forwardRows(ids[i .. i + rows], 0, true);
+            try m.promptRows(ids[i .. i + rows], 0);
             i += rows;
         }
         const handoff = try gpa.alloc(f32, steps * vocab);
@@ -210,13 +214,11 @@ pub fn main(init: std.process.Init) !void {
                 ptop += @intFromBool(top1(a) == top1(b));
             }
             std.debug.print("  states identical to the previous chunk size: {s}; decode logits identical: {s} (max |diff| {e:.2}, top-1 equal in {d} of {d})\n", .{ if (state_same) "yes" else "no", if (logit_same) "yes" else "no", pworst, ptop, steps });
-            if (!state_same or !logit_same) {
-                if (c >= allow_from) std.debug.print("  expected: {d} rows and up take another GEMM path\n", .{allow_from}) else bad = true;
-            }
+            if (!state_same or !logit_same) bad = true;
         }
         prev = snap;
         prev_logits = logits;
     }
-    std.debug.print("{s}\n", .{if (bad) "seam check: chunk sizes differ" else "seam check ok: chunk sizes agree bitwise (except where differ= names a change of path)"});
+    std.debug.print("{s}\n", .{if (bad) "seam check: chunk sizes differ" else "seam check ok: chunk sizes agree bitwise"});
     if (bad) return error.ChunkSizesDiffer;
 }

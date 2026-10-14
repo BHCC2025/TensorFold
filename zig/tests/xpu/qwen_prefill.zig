@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
         var i: usize = 0;
         while (i < n) {
             const rows = @min(c, n - i);
-            try m.forwardRows(ids.items[i .. i + rows], if (i + rows == n) 1 else 0, true);
+            try m.promptRows(ids.items[i .. i + rows], if (i + rows == n) 1 else 0);
             i += rows;
         }
         var one: [1]i32 = undefined;

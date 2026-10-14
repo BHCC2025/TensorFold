@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     while (t < ids.items.len) {
         const n = @min(rows, ids.items.len - t);
         const last = t + n == ids.items.len;
-        try m.forwardRows(ids.items[t .. t + n], if (last) 1 else 0, true);
+        try m.promptRows(ids.items[t .. t + n], if (last) 1 else 0);
         if (last) try m.rowArgmax(&first) else try m.r.sync();
         t += n;
     }

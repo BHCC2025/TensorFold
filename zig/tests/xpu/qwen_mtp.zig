@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
         while (t < prompt.len) {
             const rows = @min(@max(16, @min(win_rows, m.win.rcap)), prompt.len - t);
             const last = t + rows == prompt.len;
-            try m.forwardRows(prompt[t .. t + rows], if (last) 1 else 0, true);
+            try m.promptRows(prompt[t .. t + rows], if (last) 1 else 0);
             try r.sync(); // windows read host-written rope/token uploads: no queueing ahead across chunks
             if (last) {
                 var g: [1]i32 = undefined;

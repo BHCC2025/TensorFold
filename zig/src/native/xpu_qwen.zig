@@ -10,7 +10,7 @@ pub const formats: []const []const u8 = &.{ "mlx-q4g64", "exl3" };
 pub const name = "xpu-qwen";
 pub const Engine = qwen.Engine;
 
-/// Env TENSORFOLD_XPU_KV picks the KV cache format: bf16 by default; q8 and q4 are opt-in (q8 holds twice the context in the same memory).
+/// Env TENSORFOLD_XPU_KV picks the KV cache format: bf16 by default; q8 and q4 are opt-in.
 const kv_env = "TENSORFOLD_XPU_KV";
 
 fn kvMode(problem: *[]const u8, a: Allocator) !?qwen.attn_long.Mode {

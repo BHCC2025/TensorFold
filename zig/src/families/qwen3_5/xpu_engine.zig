@@ -126,7 +126,7 @@ pub const Engine = struct {
         var t: usize = 0;
         while (t < head.len) {
             const n = @min(rows, head.len - t);
-            try e.m.forwardRows(head[t .. t + n], 0, true);
+            try e.m.promptRows(head[t .. t + n], 0);
             t += n;
         }
         try e.r.sync();
@@ -168,7 +168,7 @@ pub const Engine = struct {
             var t: usize = 0;
             while (t < prompt.len) {
                 const n = @min(rows, prompt.len - t);
-                try m.forwardRows(prompt[t .. t + n], if (t + n == prompt.len) 1 else 0, true);
+                try m.promptRows(prompt[t .. t + n], if (t + n == prompt.len) 1 else 0);
                 t += n;
             }
             var g: [1]i32 = undefined;

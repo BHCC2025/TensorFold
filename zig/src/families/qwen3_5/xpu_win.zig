@@ -154,6 +154,7 @@ pub const Win = struct {
     head_rows: u32 = 0,
     rcap: u32 = max_rows,
     ab: u32 = max_rows,
+    prompt: bool = false, // Model.promptRows: any row count takes the prompt-chunk kernels (chunk), so a cut is invisible
     bigx: GdnX = undefined,
     xp: ?exl3.Prefill = null,
     f16pf: ?*f16p.Pf = null, // plain fp16 projections (GDN in_proj_a/b) of a prompt chunk on the 2D-load GEMM, created on first use
@@ -329,43 +330,41 @@ pub const Win = struct {
         }
         std.debug.print("  projections {d:.1} ms, kernels {d:.1} ms over {d} tokens\n", .{ @as(f64, @floatFromInt(proj_ns)) / 1e6, @as(f64, @floatFromInt(k_ns)) / 1e6, tokens });
     }
-
+    fn chunk(w: *const Win, m: u32) bool {
+        return m > max_rows or (w.prompt and w.rcap > max_rows);
+    }
     fn projInner(w: *Win, t: qb.Linear, x: Buf, m: u32, y: Buf, y_off: u32) !void {
-        if (m > max_rows) return w.projBig(t, x, m, y, y_off);
+        if (w.chunk(m)) return w.projBig(t, x, m, y, y_off);
         switch (t.format) {
             .f16 => for (0..m) |i| try w.o.matvecRaw(t, at(x, i * t.in * 2), at(y, i * t.rows * 2), y_off, .bf16),
             else => try w.o.matvecRows(t, x, m, y, y_off, w.fam),
         }
     }
 
-    /// Prompt-chunk projections (m > 16 rows): GGUF and EXL3 use their prefill GEMMs, MLX goes through 16-row windows.
+    /// Prompt-chunk projections: GGUF, EXL3, fp16 and MLX take their prefill GEMMs at every chunk size (when present).
     fn projBig(w: *Win, t: qb.Linear, x: Buf, m: u32, y: Buf, y_off: u32) !void {
         const o = w.o;
         switch (t.format) {
-            // the exact decode kernel row by row below the prefill-GEMM threshold (keeps prompts equal to decode)
-            .f16 => if (m >= 256 and f16p.Pf.ok(t.rows, t.in) and std.c.getenv("F16_NOPF") == null) {
+            .f16 => if (f16p.Pf.ok(t.rows, t.in) and std.c.getenv("F16_NOPF") == null) {
                 if (w.f16pf == null) {
                     const p = try std.heap.page_allocator.create(f16p.Pf);
                     p.* = try f16p.Pf.init(o.r);
                     w.f16pf = p;
                 }
                 try w.f16pf.?.run(o.r, t.w, x, m, y, t.in, y_off, t.rows);
-            } else if (m >= 256) try run(&w.k.mv16r, .{ (t.rows + 3) / 4, m, 1 }, .{ t.w, x, y, t.in, y_off, t.rows }) else for (0..m) |i| try o.matvecRaw(t, at(x, i * t.in * 2), at(y, i * t.rows * 2), y_off, .bf16),
+            } else try run(&w.k.mv16r, .{ (t.rows + 3) / 4, m, 1 }, .{ t.w, x, y, t.in, y_off, t.rows }),
             .bf16 => try o.matvecRows(t, x, m, y, y_off, w.fam),
-            .exl3 => if (m >= 256 and w.xp != null) {
-                try t.ex.?.forwardPrefill(&o.ex.?.eng, &w.xp.?, x, .bf16, m, at(y, @as(usize, y_off) * 2), .bf16);
-            } else try w.chunks16(t, x, m, y, y_off),
-            .mlx_affine4_g64 => if (m >= 64 and t.rows % 16 == 0 and t.in % 512 == 0 and std.c.getenv("MLX4_NOPF") == null) try o.prefillRows(t, x, m, y, y_off) else try w.chunks16(t, x, m, y, y_off),
-            else => if (m >= 32) try o.prefillRows(t, x, m, y, y_off) else try o.matvecRows(t, x, m, y, y_off, w.fam),
+            .exl3 => if (w.xp != null) try t.ex.?.forwardPrefill(&o.ex.?.eng, &w.xp.?, x, .bf16, m, at(y, @as(usize, y_off) * 2), .bf16) else try w.chunks16(t, x, m, y, y_off),
+            .mlx_affine4_g64 => if ((m >= 64 or w.prompt) and t.rows % 16 == 0 and t.in % 512 == 0 and std.c.getenv("MLX4_NOPF") == null) try o.prefillRows(t, x, m, y, y_off) else try w.chunks16(t, x, m, y, y_off),
+            else => if (m >= 32 or w.prompt) try o.prefillRows(t, x, m, y, y_off) else try o.matvecRows(t, x, m, y, y_off, w.fam),
         }
     }
 
     fn chunks16(w: *Win, t: qb.Linear, x: Buf, m: u32, y: Buf, y_off: u32) !void {
         var d: u32 = 0;
-        while (d < m) {
+        while (d < m) : (d += max_rows) {
             const n = @min(max_rows, m - d);
             try w.o.matvecRows(t, at(x, @as(usize, d) * t.in * 2), n, at(y, @as(usize, d) * t.rows * 2), y_off, w.fam);
-            d += n;
         }
     }
 
@@ -376,7 +375,7 @@ pub const Win = struct {
 
     /// qkv + z of a window: on a GGUF one fused launch for up to 8 rows (same bits as decode), else two projections.
     fn gdnProj(w: *Win, g: qb.GdnW, gx: GdnX, m: u32) !void {
-        if (m <= max_rows and w.ggFuse(g.qkv.format) and w.ggFuse(g.z.format)) {
+        if (!w.chunk(m) and w.ggFuse(g.qkv.format) and w.ggFuse(g.z.format)) {
             var d: u32 = 0;
             while (d < m) : (d += 8) {
                 const n = @min(8, m - d);
@@ -396,7 +395,7 @@ pub const Win = struct {
         const quant = al.kvMode() != .bf16; // a quantized cache takes the new rows through w.vtmp
         const vdst = if (quant) w.vtmp else a.vc;
         const voff: u32 = if (quant) 0 else pos0 * qb.kv_dim;
-        if (m <= max_rows and w.ggFuse(a.q.format) and w.ggFuse(a.k.format) and w.ggFuse(a.v.format)) {
+        if (!w.chunk(m) and w.ggFuse(a.q.format) and w.ggFuse(a.k.format) and w.ggFuse(a.v.format)) {
             var d: u32 = 0;
             while (d < m) : (d += 8) {
                 const n = @min(8, m - d);
@@ -451,7 +450,7 @@ pub const Win = struct {
             try run(if (w.o.f32_norm) &w.k.a_prep32 else &w.k.a_prep, .{ qb.heads + qb.kv_heads, m, 1 }, .{ w.qg, w.kraw, a.qn, a.kn, w.rope, w.q, w.ktmp, @as(u64, 0), w.o.eps });
             try w.o.kvAppend(a.kc, a.vc, w.ktmp, w.vtmp, pos0, m);
         } else try run(if (w.o.f32_norm) &w.k.a_prep32 else &w.k.a_prep, .{ qb.heads + qb.kv_heads, m, 1 }, .{ w.qg, w.kraw, a.qn, a.kn, w.rope, w.q, a.kc, @as(u64, pos0) * qb.kv_dim, w.o.eps });
-        if (m > max_rows and w.rcap > max_rows and pfEnv(null)) {
+        if (w.chunk(m) and w.rcap > max_rows and pfEnv(null)) {
             // prompt window on the matrix engine (its own K / V rows are already cached): 8 rows x 6 heads a work-group
             const mi: usize = @intFromEnum(al.kvMode());
             if (w.pfs[mi] == null) w.pfs[mi] = try al.Pfs.init(w.r, al.kvMode(), w.rcap);
@@ -461,7 +460,7 @@ pub const Win = struct {
             w.pending = true;
             return;
         }
-        if (m > max_rows and w.pf != null) {
+        if (w.chunk(m) and w.pf != null) {
             // prompt window: causal flash attention on the matrix engine, 16 rows a work-group, 24 heads
             try run(&w.pf.?, .{ (m + 15) / 16, qb.heads, 1 }, .{ w.q, a.kc, a.vc, w.qg, w.att, pos0, m, @as(f32, 0.0625) });
             try w.proj(a.o, w.att, m, w.delta, 0);
@@ -488,12 +487,12 @@ pub const Win = struct {
     fn mlp(w: *Win, p: qb.MlpW, m: u32) !void {
         const o = w.o;
         try w.normIn(p.norm, m);
-        if (m <= max_rows and p.gate.block and try o.gateUpBlock(p.gate, p.up, w.xn, w.act, m)) {
+        if (!w.chunk(m) and p.gate.block and try o.gateUpBlock(p.gate, p.up, w.xn, w.act, m)) {
             // block layout: gate and up partials, one merge + SwiGLU launch
-        } else if (m <= max_rows and w.fam == .exact and p.gate.format == .mlx_affine4_g64 and p.up.format == .mlx_affine4_g64 and !p.gate.block) {
+        } else if (!w.chunk(m) and w.fam == .exact and p.gate.format == .mlx_affine4_g64 and p.up.format == .mlx_affine4_g64 and !p.gate.block) {
             try o.ensureRows();
             try o.mr.?.gateUp(p.gate.w, p.gate.s, p.gate.b, p.up.w, p.up.s, p.up.b, w.xn, w.act, hidden, inter, m);
-        } else if (m <= max_rows and w.ggFuse(p.gate.format) and w.ggFuse(p.up.format)) {
+        } else if (!w.chunk(m) and w.ggFuse(p.gate.format) and w.ggFuse(p.up.format)) {
             var d: u32 = 0; // gate + up + SwiGLU in one launch an 8-row chunk (the single-row decode's kernel per row)
             while (d < m) : (d += 8) try o.gg.?.gateUpRows(qb.ggType(p.gate.format).?, p.gate.w, qb.ggType(p.up.format).?, p.up.w, at(w.xn, @as(usize, d) * hidden * 2), at(w.act, @as(usize, d) * inter * 2), hidden, inter, @min(8, m - d));
         } else {
@@ -539,7 +538,7 @@ pub const Win = struct {
         try w.setRope(pos0, m);
         for (layers, 0..) |ly, i| {
             switch (ly.mixer) {
-                .gdn => |g| try w.gdn(g, if (m > max_rows) w.bigx else w.gx[i], m, inplace),
+                .gdn => |g| try w.gdn(g, if (w.chunk(m)) w.bigx else w.gx[i], m, inplace),
                 .attn => |a| try w.attention(a, m, pos0),
             }
             try w.mlp(ly.mlp, m);
